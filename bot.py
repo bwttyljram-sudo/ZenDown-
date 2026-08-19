@@ -56,7 +56,7 @@ CHANNEL = "@ZenoX_Tools"
 ADMIN_ID = 6043858925
 
 # أقصى عدد تحميلات متزامنة لحماية الموارد
-MAX_CONCURRENT_DOWNLOADS = 1 # تم تقليله لـ 1 لضمان استقرار السيرفر المجاني
+MAX_CONCURRENT_DOWNLOADS = 1 
 DOWNLOAD_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 
 # ذاكرة مؤقتة
@@ -282,28 +282,70 @@ def _blocking_download(url, opts):
         return ydl.prepare_filename(info)
 
 def _compress_video_sync(input_file, output_file):
-    # خوارزمية ضغط مُصممة خصيصاً للسيرفرات الضعيفة لمنع التعليق
     cmd = [
         'ffmpeg', '-y', '-i', input_file, 
         '-c:v', 'libx264', 
-        '-preset', 'ultrafast',   # أسرع وضع لعدم خنق المعالج (كان faster وهذا ما سبب التعليق)
-        '-threads', '1',          # إجبار الخادم على مسار واحد لمنع انهيار الرام
-        '-crf', '35',             # ضغط قاسي لتقليل الحجم
-        '-vf', "scale='min(480,iw)':-2", # تصغير إلى 480p لسرعة المعالجة
-        '-r', '24',               # تقليل الإطارات لتخفيف العبء
+        '-preset', 'ultrafast',   
+        '-threads', '1',          
+        '-crf', '35',             
+        '-vf', "scale='min(480,iw)':-2", 
+        '-r', '24',               
         '-c:a', 'aac', '-b:a', '64k',
         output_file
     ]
     try:
-        # مهلة 3 دقائق، لو تأخر أكثر سيتم قتله ليتحرر البوت بدلاً من التعليق الأبدي
         subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT, timeout=180)
         if os.path.exists(output_file) and os.path.getsize(output_file) > 0:
             return output_file
     except subprocess.TimeoutExpired:
-        pass # تم تجاوز الوقت المحدد
+        pass 
     except Exception:
-        pass # حدث خطأ أو FFMPEG غير مثبت
+        pass 
     return input_file
+
+# ================== دالة التخطي الجديدة ليوتيوب (تستخدم مكتبات السيرفر الافتراضية) ==================
+def _blocking_download_cobalt(url, action, out_tmpl):
+    api_url = "https://api.cobalt.tools/"
+    user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    
+    # إعداد جودة الفيديو أو الصوت
+    payload_dict = {"url": url}
+    if action == "vid":
+        payload_dict["videoQuality"] = "720"
+    else:
+        payload_dict["isAudioOnly"] = True
+        
+    data = json.dumps(payload_dict).encode('utf-8')
+    
+    # طلب الرابط المباشر من وسيط التخطي
+    req = urllib.request.Request(
+        api_url, 
+        data=data, 
+        headers={"Accept": "application/json", "Content-Type": "application/json", "User-Agent": user_agent},
+        method="POST"
+    )
+    
+    with urllib.request.urlopen(req, timeout=15) as res:
+        res_data = json.loads(res.read().decode('utf-8'))
+        direct_url = res_data.get("url")
+        
+    if not direct_url:
+        raise Exception("فشل وسيط التحميل في استخراج الرابط المباشر.")
+        
+    # تحديد صيغة الملف النهائي
+    ext = "mp4" if action == "vid" else "mp3"
+    if action == "voc": ext = "ogg"
+    file_path = out_tmpl.replace("%(ext)s", ext)
+    
+    # تحميل الملف الفعلي إلى السيرفر
+    req_dl = urllib.request.Request(direct_url, headers={"User-Agent": user_agent})
+    with urllib.request.urlopen(req_dl, timeout=120) as r, open(file_path, 'wb') as f:
+        while True:
+            chunk = r.read(32768) # 32KB chunks للتحميل السريع
+            if not chunk: break
+            f.write(chunk)
+            
+    return file_path
 
 # ================== استقبال الرسائل والبدء ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -543,9 +585,20 @@ async def download_action_callback(update: Update, context: ContextTypes.DEFAULT
 
         for attempt in range(max_retries):
             try:
-                file_path = await asyncio.to_thread(_blocking_download, url, opts)
-                if action == "aud": file_path = file_path.rsplit('.', 1)[0] + '.mp3'
-                if action == "voc": file_path = file_path.rsplit('.', 1)[0] + '.ogg'
+                # ----------------- تعديل تخطي حظر يوتيوب المباشر -----------------
+                if "youtube.com" in url or "youtu.be" in url:
+                    try:
+                        file_path = await asyncio.to_thread(_blocking_download_cobalt, url, action, out_tmpl)
+                    except Exception as yt_err:
+                        logger.error(f"فشل التخطي الذكي، محاولة بديلة: {yt_err}")
+                        file_path = await asyncio.to_thread(_blocking_download, url, opts)
+                        if action == "aud": file_path = file_path.rsplit('.', 1)[0] + '.mp3'
+                        if action == "voc": file_path = file_path.rsplit('.', 1)[0] + '.ogg'
+                else:
+                    file_path = await asyncio.to_thread(_blocking_download, url, opts)
+                    if action == "aud": file_path = file_path.rsplit('.', 1)[0] + '.mp3'
+                    if action == "voc": file_path = file_path.rsplit('.', 1)[0] + '.ogg'
+                # -----------------------------------------------------------------
                 
                 if os.path.exists(file_path):
                     success_download = True
@@ -572,7 +625,7 @@ async def download_action_callback(update: Update, context: ContextTypes.DEFAULT
                 if final_size_mb >= 49.5:
                     await status_msg.edit_text(f"❌ عذراً، المقطع كبير جداً ({final_size_mb:.1f} ميجا). الحد الأقصى للبوتات هو 50 ميجا.")
                     track_download_status(False)
-                    return # نخرج من العملية فوراً
+                    return 
 
                 await status_msg.edit_text("📤 جاري إرسال الملف...")
                 with open(file_path, 'rb') as f:
@@ -612,9 +665,10 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(r"^/dl_"), handle_message))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
 
-    print("🚀 تم تشغيل محرك @ZenDown_Bot بنجاح! مزود بحماية الـ OOM والجدار الأمني لتيليجرام.")
+    print("🚀 تم تشغيل محرك @ZenDown_Bot بنجاح! مزود بحماية الـ OOM والجدار الأمني لتيليجرام وتخطي حظر يوتيوب الذكي.")
     app.run_polling(drop_pending_updates=False)
 
 if __name__ == "__main__":
     main()
+
 
