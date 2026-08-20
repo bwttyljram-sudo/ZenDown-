@@ -303,12 +303,17 @@ def _compress_video_sync(input_file, output_file):
         pass 
     return input_file
 
-# ================== دالة التخطي الجديدة ليوتيوب (تستخدم مكتبات السيرفر الافتراضية) ==================
+# ================== التخطي الذكي ليوتيوب (النسخة المحدثة الآمنة) ==================
 def _blocking_download_cobalt(url, action, out_tmpl):
-    api_url = "https://api.cobalt.tools/"
-    user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
     
-    # إعداد جودة الفيديو أو الصوت
+    # سيرفرات احتياطية في حال تعطل أحدها
+    cobalt_instances = [
+        "https://api.cobalt.tools",
+        "https://cobalt.q0.is", 
+        "https://api.cobalt.acyl.page"
+    ]
+    
     payload_dict = {"url": url}
     if action == "vid":
         payload_dict["videoQuality"] = "720"
@@ -316,32 +321,38 @@ def _blocking_download_cobalt(url, action, out_tmpl):
         payload_dict["isAudioOnly"] = True
         
     data = json.dumps(payload_dict).encode('utf-8')
-    
-    # طلب الرابط المباشر من وسيط التخطي
-    req = urllib.request.Request(
-        api_url, 
-        data=data, 
-        headers={"Accept": "application/json", "Content-Type": "application/json", "User-Agent": user_agent},
-        method="POST"
-    )
-    
-    with urllib.request.urlopen(req, timeout=15) as res:
-        res_data = json.loads(res.read().decode('utf-8'))
-        direct_url = res_data.get("url")
-        
+    direct_url = None
+
+    for instance in cobalt_instances:
+        try:
+            origin_url = instance.replace("api.", "")
+            headers = {
+                "Accept": "application/json", 
+                "Content-Type": "application/json", 
+                "User-Agent": user_agent,
+                "Origin": origin_url,
+                "Referer": origin_url + "/"
+            }
+            req = urllib.request.Request(instance, data=data, headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=10) as res:
+                res_data = json.loads(res.read().decode('utf-8'))
+                if "url" in res_data:
+                    direct_url = res_data.get("url")
+                    break # نجحنا! نوقف البحث
+        except Exception as e:
+            continue # فشل؟ نجرب السيرفر اللي بعده
+            
     if not direct_url:
-        raise Exception("فشل وسيط التحميل في استخراج الرابط المباشر.")
+        raise Exception("فشل وسيط التحميل في استخراج الرابط المباشر من جميع السيرفرات.")
         
-    # تحديد صيغة الملف النهائي
     ext = "mp4" if action == "vid" else "mp3"
     if action == "voc": ext = "ogg"
     file_path = out_tmpl.replace("%(ext)s", ext)
     
-    # تحميل الملف الفعلي إلى السيرفر
     req_dl = urllib.request.Request(direct_url, headers={"User-Agent": user_agent})
     with urllib.request.urlopen(req_dl, timeout=120) as r, open(file_path, 'wb') as f:
         while True:
-            chunk = r.read(32768) # 32KB chunks للتحميل السريع
+            chunk = r.read(65536) # تحميل سريع بتقسيم 64KB
             if not chunk: break
             f.write(chunk)
             
@@ -585,7 +596,7 @@ async def download_action_callback(update: Update, context: ContextTypes.DEFAULT
 
         for attempt in range(max_retries):
             try:
-                # ----------------- تعديل تخطي حظر يوتيوب المباشر -----------------
+                # التخطي الذكي ليوتيوب
                 if "youtube.com" in url or "youtu.be" in url:
                     try:
                         file_path = await asyncio.to_thread(_blocking_download_cobalt, url, action, out_tmpl)
@@ -598,7 +609,6 @@ async def download_action_callback(update: Update, context: ContextTypes.DEFAULT
                     file_path = await asyncio.to_thread(_blocking_download, url, opts)
                     if action == "aud": file_path = file_path.rsplit('.', 1)[0] + '.mp3'
                     if action == "voc": file_path = file_path.rsplit('.', 1)[0] + '.ogg'
-                # -----------------------------------------------------------------
                 
                 if os.path.exists(file_path):
                     success_download = True
@@ -620,7 +630,7 @@ async def download_action_callback(update: Update, context: ContextTypes.DEFAULT
                     comp_path = file_path.rsplit('.', 1)[0] + '_c.mp4'
                     file_path = await asyncio.to_thread(_compress_video_sync, file_path, comp_path)
 
-                # جدار حماية تيليجرام: فحص الحجم النهائي لمنع التعليق الوهمي أثناء الرفع
+                # جدار حماية تيليجرام: فحص الحجم النهائي
                 final_size_mb = os.path.getsize(file_path) / (1024 * 1024)
                 if final_size_mb >= 49.5:
                     await status_msg.edit_text(f"❌ عذراً، المقطع كبير جداً ({final_size_mb:.1f} ميجا). الحد الأقصى للبوتات هو 50 ميجا.")
@@ -670,5 +680,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
