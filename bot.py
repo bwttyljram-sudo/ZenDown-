@@ -218,7 +218,7 @@ async def show_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "🔄 <b>تحديث الإحصائيات:</b> كل 100 حدث أو عند الإيقاف"
     )
 
-    markup = InlineKeyboardMarkup([[InlineKeyboardButton("تحديث 🔄", callback_data="refresh_stats")]])
+    markup = InlineKeyboardMarkup([[InlineKeyboardButton("تحديث 🔄", callback_data="refresh_stats", style="primary")]])
     if update.callback_query:
         await update.callback_query.answer("تم التحديث 🔄")
         try:
@@ -313,8 +313,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not await check_user_subscription(context.bot, user.id):
         markup = InlineKeyboardMarkup([
-            [InlineKeyboardButton("اشترك في القناة 📡", url=f"https://t.me/{CHANNEL.lstrip('@')}")],
-            [InlineKeyboardButton("تحقق 🔍", callback_data="check_sub")]
+            [InlineKeyboardButton("اشترك في القناة 📡", url=f"https://t.me/{CHANNEL.lstrip('@')}", style="primary")],
+            [InlineKeyboardButton("تحقق 🔍", callback_data="check_sub", style="success")]
         ])
         await update.message.reply_text("🚧 عذراً، يجب الاشتراك بالقناة أولاً لاستخدام البوت.", reply_markup=markup)
         return
@@ -391,9 +391,9 @@ def build_search_page(sid, page):
     
     buttons = []
     if end_idx < total:
-        buttons.append(InlineKeyboardButton("التالي »", callback_data=f"page_{sid}_{page+1}"))
+        buttons.append(InlineKeyboardButton("التالي »", callback_data=f"page_{sid}_{page+1}", style="primary"))
     if page > 0:
-        buttons.append(InlineKeyboardButton("« السابق", callback_data=f"page_{sid}_{page-1}"))
+        buttons.append(InlineKeyboardButton("« السابق", callback_data=f"page_{sid}_{page-1}", style="primary"))
         
     markup = InlineKeyboardMarkup([buttons]) if buttons else None
     return text, markup
@@ -470,9 +470,9 @@ async def process_link_info(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
     caption = f"🎬 <b>{title}</b>\n👤 المصدر: {uploader}"
     markup = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎥 فيديو MP4", callback_data=f"down_vid_{sid}")],
-        [InlineKeyboardButton("🎵 صوت MP3", callback_data=f"down_aud_{sid}"),
-         InlineKeyboardButton("🎙 بصمة صوتية", callback_data=f"down_voc_{sid}")]
+        [InlineKeyboardButton("🎥 فيديو MP4", callback_data=f"down_vid_{sid}", style="primary")],
+        [InlineKeyboardButton("🎵 صوت MP3", callback_data=f"down_aud_{sid}", style="success"),
+         InlineKeyboardButton("🎙 بصمة صوتية", callback_data=f"down_voc_{sid}", style="success")]
     ])
 
     await msg.delete()
@@ -617,6 +617,8 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
 
 
 
