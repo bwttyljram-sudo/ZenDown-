@@ -26,6 +26,26 @@ except Exception as e:
 
 from yt_dlp import YoutubeDL
 
+# تثبيت/تحديث Deno تلقائياً - تيك توك صار يطلب حل تحدي جافاسكريبت (JS challenge)
+# و yt-dlp يحتاج Deno مثبت على السيرفر عشان يحله وإلا التحميل من تيك توك يفشل بصمت
+try:
+    deno_check = subprocess.run(["deno", "--version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if deno_check.returncode != 0:
+        raise FileNotFoundError
+    print("✅ Deno متوفر بالفعل.")
+except Exception:
+    try:
+        print("🔄 Deno غير موجود، جاري تثبيته (مطلوب لتحميل تيك توك)...")
+        subprocess.run(
+            "curl -fsSL https://deno.land/install.sh | sh -s -- -y",
+            shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120
+        )
+        deno_bin = os.path.expanduser("~/.deno/bin")
+        os.environ["PATH"] = deno_bin + os.pathsep + os.environ.get("PATH", "")
+        print("✅ تم تثبيت Deno.")
+    except Exception as e:
+        print(f"⚠️ تعذر تثبيت Deno تلقائياً: {e} — تحميل تيك توك قد يستمر بالفشل حتى يُثبَّت يدوياً.")
+
 # ================== سيرفر الصحة لإرضاء المنصة (Render/UptimeRobot) ==================
 class DummyHealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -55,9 +75,13 @@ TOKEN = os.environ.get("BOT_TOKEN")
 CHANNEL = "@ZenoX_Tools"
 ADMIN_ID = 6043858925
 
-# أقصى عدد تحميلات متزامنة لحماية الموارد
-MAX_CONCURRENT_DOWNLOADS = 1 
+# أقصى عدد تحميلات متزامنة لحماية الموارد (تحميل فقط - لا يشمل الضغط)
+MAX_CONCURRENT_DOWNLOADS = 4
 DOWNLOAD_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
+
+# سيمافور منفصل للضغط فقط - عشان ما يوقفش باقي المستخدمين وهم بس بيحملوا
+MAX_CONCURRENT_COMPRESSIONS = 2
+COMPRESS_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_COMPRESSIONS)
 
 # ذاكرة مؤقتة
 SEARCH_CACHE = {}
@@ -266,7 +290,8 @@ def _blocking_extract_info(url):
         'no_warnings': True,
         'extractor_args': {
             'youtube': {'player_client': ['android', 'ios', 'mweb', 'web']},
-            'twitter': {'api': ['syndication']}
+            'twitter': {'api': ['syndication']},
+            'tiktok': {'api_hostname': ['api22-normal-c-useast2a.tiktokv.com']}
         },
         'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
         'geo_bypass': True, 
@@ -286,7 +311,7 @@ def _compress_video_sync(input_file, output_file):
         'ffmpeg', '-y', '-i', input_file, 
         '-c:v', 'libx264', 
         '-preset', 'ultrafast',
-        '-threads', '1',
+        '-threads', '0',
         '-crf', '35',
         '-vf', "scale='min(480,iw)':-2",
         '-r', '24',
@@ -495,58 +520,60 @@ async def download_action_callback(update: Update, context: ContextTypes.DEFAULT
         return
 
     status_msg = await q.message.reply_text("⏳ أضيفت إلى طابور التحميل الذكي...")
-    
+    out_tmpl = f"zendown_{sid}.%(ext)s"
+
+    if action == "vid":
+        opts = {
+            'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+            'outtmpl': out_tmpl,
+            'quiet': True,
+            'no_warnings': True,
+            'geo_bypass': True,
+            'nocheckcertificate': True,
+            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+            'extractor_args': {
+                'youtube': {'player_client': ['android', 'ios', 'web']},
+                'twitter': {'api': ['syndication']},
+                'tiktok': {'api_hostname': ['api22-normal-c-useast2a.tiktokv.com']}
+            }
+        }
+    elif action == "aud":
+        opts = {
+            'format': 'bestaudio/best',
+            'outtmpl': out_tmpl,
+            'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'}],
+            'quiet': True,
+            'no_warnings': True,
+            'geo_bypass': True,
+            'nocheckcertificate': True,
+            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+        }
+    else:
+        opts = {
+            'format': 'bestaudio/best',
+            'outtmpl': out_tmpl,
+            'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'vorbis'}],
+            'quiet': True,
+            'no_warnings': True,
+            'geo_bypass': True,
+            'nocheckcertificate': True,
+            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+        }
+
+    file_path = None
+    max_retries = 3
+    success_download = False
+
+    # === مرحلة التحميل فقط - يتحرر السيمافور فور انتهاء التحميل ===
+    # ده بيسمح لمستخدمين تانيين يبدأوا تحميلهم فوراً حتى لو واحد لسه بيضغط فيديوه
     async with DOWNLOAD_SEMAPHORE:
-        await status_msg.edit_text("🚀 جاري التحميل والمعالجة السريعة...")
-        out_tmpl = f"zendown_{sid}.%(ext)s"
-        
-        if action == "vid":
-            opts = {
-                'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-                'outtmpl': out_tmpl,
-                'quiet': True,
-                'no_warnings': True,
-                'geo_bypass': True,
-                'nocheckcertificate': True,
-                'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-                'extractor_args': {
-                    'youtube': {'player_client': ['android', 'ios', 'web']},
-                    'twitter': {'api': ['syndication']}
-                }
-            }
-        elif action == "aud":
-            opts = {
-                'format': 'bestaudio/best',
-                'outtmpl': out_tmpl,
-                'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'}],
-                'quiet': True,
-                'no_warnings': True,
-                'geo_bypass': True,
-                'nocheckcertificate': True,
-                'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-            }
-        else:
-            opts = {
-                'format': 'bestaudio/best',
-                'outtmpl': out_tmpl,
-                'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'vorbis'}],
-                'quiet': True,
-                'no_warnings': True,
-                'geo_bypass': True,
-                'nocheckcertificate': True,
-                'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-            }
-
-        file_path = None
-        max_retries = 3 
-        success_download = False
-
+        await status_msg.edit_text("🚀 جاري التحميل...")
         for attempt in range(max_retries):
             try:
                 file_path = await asyncio.to_thread(_blocking_download, url, opts)
                 if action == "aud": file_path = file_path.rsplit('.', 1)[0] + '.mp3'
                 if action == "voc": file_path = file_path.rsplit('.', 1)[0] + '.ogg'
-                
+
                 if os.path.exists(file_path):
                     success_download = True
                     break
@@ -554,45 +581,47 @@ async def download_action_callback(update: Update, context: ContextTypes.DEFAULT
                 logger.error(f"Attempt {attempt + 1} failed: {e}")
                 if attempt < max_retries - 1:
                     await status_msg.edit_text(f"⚠️ جاري المحاولة مرة أخرى ({attempt + 2}/{max_retries})...")
-                    await asyncio.sleep(2) 
+                    await asyncio.sleep(2)
                 else:
                     pass
 
-        try:
-            if success_download and file_path and os.path.exists(file_path):
-                
-                # مرحلة الضغط
-                if action == "vid" and (os.path.getsize(file_path) / (1024*1024)) > 45:
-                    await status_msg.edit_text("🗜 حجم المقطع كبير.. جاري الضغط السريع (قد يستغرق دقيقتين)...")
+    # === مرحلة الضغط والإرسال - خارج طابور التحميل، تحت سيمافور مستقل ===
+    try:
+        if success_download and file_path and os.path.exists(file_path):
+
+            needs_compress = action == "vid" and (os.path.getsize(file_path) / (1024*1024)) > 45
+            if needs_compress:
+                await status_msg.edit_text("🗜 حجم المقطع كبير.. جاري الضغط السريع (طلبات المستخدمين الآخرين تستمر بدون توقف)...")
+                async with COMPRESS_SEMAPHORE:
                     comp_path = file_path.rsplit('.', 1)[0] + '_c.mp4'
                     file_path = await asyncio.to_thread(_compress_video_sync, file_path, comp_path)
 
-                # جدار حماية تيليجرام
-                final_size_mb = os.path.getsize(file_path) / (1024 * 1024)
-                if final_size_mb >= 49.5:
-                    await status_msg.edit_text(f"❌ عذراً، المقطع كبير جداً ({final_size_mb:.1f} ميجا). الحد الأقصى للبوتات هو 50 ميجا.")
-                    track_download_status(False)
-                    return 
-
-                await status_msg.edit_text("📤 جاري إرسال الملف...")
-                with open(file_path, 'rb') as f:
-                    if action == "vid": await q.message.reply_video(video=f, caption="🎬 تم بواسطة @ZenDown_Bot", supports_streaming=True)
-                    elif action == "aud": await q.message.reply_audio(audio=f, caption="🎵 تم بواسطة @ZenDown_Bot")
-                    elif action == "voc": await q.message.reply_voice(voice=f, caption="🎙 تم بواسطة @ZenDown_Bot")
-
-                track_download_status(True)
-                await status_msg.delete()
-            else:
+            # جدار حماية تيليجرام
+            final_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+            if final_size_mb >= 49.5:
+                await status_msg.edit_text(f"❌ عذراً، المقطع كبير جداً ({final_size_mb:.1f} ميجا). الحد الأقصى للبوتات هو 50 ميجا.")
                 track_download_status(False)
-                await status_msg.edit_text("❌ حدث خطأ أثناء التحميل، قد يكون المقطع محمي كلياً أو يحتاج تسجيلاً إجبارياً.")
-        except Exception as e:
-            logger.error(f"Send Error: {e}")
+                return
+
+            await status_msg.edit_text("📤 جاري إرسال الملف...")
+            with open(file_path, 'rb') as f:
+                if action == "vid": await q.message.reply_video(video=f, caption="🎬 تم بواسطة @ZenDown_Bot", supports_streaming=True)
+                elif action == "aud": await q.message.reply_audio(audio=f, caption="🎵 تم بواسطة @ZenDown_Bot")
+                elif action == "voc": await q.message.reply_voice(voice=f, caption="🎙 تم بواسطة @ZenDown_Bot")
+
+            track_download_status(True)
+            await status_msg.delete()
+        else:
             track_download_status(False)
-            await status_msg.edit_text("❌ حدث خطأ أثناء معالجة وإرسال الملف.")
-        finally:
-            if file_path and os.path.exists(file_path):
-                try: os.remove(file_path)
-                except Exception: pass
+            await status_msg.edit_text("❌ حدث خطأ أثناء التحميل، قد يكون المقطع محمي كلياً أو يحتاج تسجيلاً إجبارياً.")
+    except Exception as e:
+        logger.error(f"Send Error: {e}")
+        track_download_status(False)
+        await status_msg.edit_text("❌ حدث خطأ أثناء معالجة وإرسال الملف.")
+    finally:
+        if file_path and os.path.exists(file_path):
+            try: os.remove(file_path)
+            except Exception: pass
 
 # ================== التشغيل الرئيسي ==================
 def main():
@@ -617,6 +646,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
