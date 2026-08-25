@@ -18,13 +18,21 @@ from health_server import run_health_server_in_background
 # تحديث تلقائي لمكتبة yt-dlp
 try:
     print("🔄 جاري التحقق من تحديثات yt-dlp...")
-    subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", "yt-dlp"], 
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    print("✅ yt-dlp محدث لأحدث إصدار!")
+    _update_result = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "--upgrade", "--no-cache-dir", "yt-dlp"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=90
+    )
+    if _update_result.returncode == 0:
+        print("✅ yt-dlp محدث لأحدث إصدار!")
+    else:
+        # قبل كنا نطبع "تم التحديث" حتى لو فشل الأمر فعلياً لأننا ما كنا نتحقق من نتيجته!
+        print(f"⚠️ فشل تحديث yt-dlp (exit code {_update_result.returncode}):\n{_update_result.stdout.decode(errors='ignore')[-800:]}")
 except Exception as e:
     print(f"⚠️ فشل التحديث التلقائي: {e}")
 
 from yt_dlp import YoutubeDL
+import yt_dlp as _ytdlp_module
+print(f"📦 نسخة yt-dlp الحالية قيد التشغيل: {_ytdlp_module.version.__version__}")
 
 # ================== سيرفر الصحة لإرضاء المنصة (Render/UptimeRobot) ==================
 # تم نقل الكود الفعلي إلى health_server.py — هذا فقط يشغّله في الخلفية
@@ -238,7 +246,7 @@ async def show_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "🔄 <b>تحديث الإحصائيات:</b> كل 100 حدث أو عند الإيقاف"
     )
 
-    markup = InlineKeyboardMarkup([[InlineKeyboardButton("تحديث 🔄", callback_data="refresh_stats")]])
+    markup = InlineKeyboardMarkup([[InlineKeyboardButton("تحديث 🔄", callback_data="refresh_stats", style="primary")]])
     if update.callback_query:
         await update.callback_query.answer("تم التحديث 🔄")
         try:
@@ -417,8 +425,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not await check_user_subscription(context.bot, user.id):
         markup = InlineKeyboardMarkup([
-            [InlineKeyboardButton("اشترك في القناة 📡", url=f"https://t.me/{CHANNEL.lstrip('@')}")],
-            [InlineKeyboardButton("تحقق 🔍", callback_data="check_sub")]
+            [InlineKeyboardButton("اشترك في القناة 📡", url=f"https://t.me/{CHANNEL.lstrip('@')}", style="primary")],
+            [InlineKeyboardButton("تحقق 🔍", callback_data="check_sub", style="success")]
         ])
         await update.message.reply_text("🚧 عذراً، يجب الاشتراك بالقناة أولاً لاستخدام البوت.", reply_markup=markup)
         return
@@ -447,8 +455,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not await check_user_subscription(context.bot, user.id):
         markup = InlineKeyboardMarkup([
-            [InlineKeyboardButton("اشترك في القناة 📡", url=f"https://t.me/{CHANNEL.lstrip('@')}")],
-            [InlineKeyboardButton("تحقق 🔍", callback_data="check_sub")]
+            [InlineKeyboardButton("اشترك في القناة 📡", url=f"https://t.me/{CHANNEL.lstrip('@')}", style="primary")],
+            [InlineKeyboardButton("تحقق 🔍", callback_data="check_sub", style="success")]
         ])
         await update.message.reply_text("🚧 يرجى الاشتراك في القناة أولاً.", reply_markup=markup)
         return
@@ -505,9 +513,9 @@ def build_search_page(sid, page):
     
     buttons = []
     if end_idx < total:
-        buttons.append(InlineKeyboardButton("التالي »", callback_data=f"page_{sid}_{page+1}"))
+        buttons.append(InlineKeyboardButton("التالي »", callback_data=f"page_{sid}_{page+1}", style="primary"))
     if page > 0:
-        buttons.append(InlineKeyboardButton("« السابق", callback_data=f"page_{sid}_{page-1}"))
+        buttons.append(InlineKeyboardButton("« السابق", callback_data=f"page_{sid}_{page-1}", style="primary"))
 
     markup = InlineKeyboardMarkup([buttons]) if buttons else None
     return text, markup
@@ -584,9 +592,9 @@ async def process_link_info(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
     caption = f"🎬 <b>{title}</b>\n👤 المصدر: {uploader}"
     markup = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎥 فيديو MP4", callback_data=f"down_vid_{sid}")],
-        [InlineKeyboardButton("🎵 صوت MP3", callback_data=f"down_aud_{sid}"),
-         InlineKeyboardButton("🎙 بصمة صوتية", callback_data=f"down_voc_{sid}")]
+        [InlineKeyboardButton("🎥 فيديو MP4", callback_data=f"down_vid_{sid}", style="primary")],
+        [InlineKeyboardButton("🎵 صوت MP3", callback_data=f"down_aud_{sid}", style="success"),
+         InlineKeyboardButton("🎙 بصمة صوتية", callback_data=f"down_voc_{sid}", style="success")]
     ])
 
     await msg.delete()
@@ -777,6 +785,8 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
 
 
 
