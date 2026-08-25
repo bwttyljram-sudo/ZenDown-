@@ -4,16 +4,16 @@ import asyncio
 import logging
 import os
 import uuid
-import threading
 import json
 import urllib.request
 import time
+import random
 from datetime import datetime, timedelta
-from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
     ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, CallbackQueryHandler, filters
 )
+from health_server import run_health_server_in_background
 
 # تحديث تلقائي لمكتبة yt-dlp
 try:
@@ -27,25 +27,9 @@ except Exception as e:
 from yt_dlp import YoutubeDL
 
 # ================== سيرفر الصحة لإرضاء المنصة (Render/UptimeRobot) ==================
-class DummyHealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"ZenDown_Bot is Running!")
-        
-    def do_HEAD(self):
-        self.send_response(200)
-        self.end_headers()
+# تم نقل الكود الفعلي إلى health_server.py — هذا فقط يشغّله في الخلفية
+run_health_server_in_background()
 
-    def log_message(self, format, *args):
-        return
-
-def start_dummy_server():
-    port = int(os.environ.get("PORT", 8080))
-    server = HTTPServer(("0.0.0.0", port), DummyHealthCheckHandler)
-    server.serve_forever()
-
-threading.Thread(target=start_dummy_server, daemon=True).start()
 
 # ================== الإعدادات والتكوين ==================
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
@@ -53,15 +37,51 @@ logger = logging.getLogger("ZenDown_Bot")
 
 TOKEN = os.environ.get("BOT_TOKEN")
 CHANNEL = "@ZenoX_Tools"
-ADMIN_ID = 6043858925
+# نقرأ الآيدي من متغير البيئة ID (نفس المتغير المضاف بلوحة Render) بدل ترقيمه يدوياً بالكود،
+# مع الاحتفاظ بقيمة احتياطية لو المتغير غير موجود لأي سبب
+try:
+    ADMIN_ID = int(os.environ.get("ID", "6043858925"))
+except (TypeError, ValueError):
+    ADMIN_ID = 6043858925
 
 # أقصى عدد تحميلات متزامنة لحماية الموارد
 MAX_CONCURRENT_DOWNLOADS = 1 # تم تقليله لـ 1 لضمان استقرار السيرفر المجاني
 DOWNLOAD_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 
-# ذاكرة مؤقتة
-SEARCH_CACHE = {}
-URL_CACHE = {}
+# ذاكرة مؤقتة (تُحفظ على القرص لتنجو من إعادة التشغيل: نوم Render التلقائي أو أي Deploy جديد)
+CACHE_FILE = "session_cache.json"
+MAX_CACHE_ENTRIES = 300  # سقف بسيط لمنع تضخم الملف على المدى الطويل
+
+def _load_cache():
+    if os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return data.get("url_cache", {}), data.get("search_cache", {})
+        except Exception:
+            pass
+    return {}, {}
+
+URL_CACHE, SEARCH_CACHE = _load_cache()
+
+def _save_cache():
+    try:
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"url_cache": URL_CACHE, "search_cache": SEARCH_CACHE}, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+def cache_url(sid, url):
+    URL_CACHE[sid] = url
+    if len(URL_CACHE) > MAX_CACHE_ENTRIES:
+        URL_CACHE.pop(next(iter(URL_CACHE)))  # نحذف أقدم إدخال (ترتيب الإدخال محفوظ بالـ dict)
+    _save_cache()
+
+def cache_search(sid, data):
+    SEARCH_CACHE[sid] = data
+    if len(SEARCH_CACHE) > MAX_CACHE_ENTRIES:
+        SEARCH_CACHE.pop(next(iter(SEARCH_CACHE)))
+    _save_cache()
 
 # ================== نظام الإحصائيات ==================
 STATS_FILE = "stats.json"
@@ -218,7 +238,7 @@ async def show_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "🔄 <b>تحديث الإحصائيات:</b> كل 100 حدث أو عند الإيقاف"
     )
 
-    markup = InlineKeyboardMarkup([[InlineKeyboardButton("تحديث 🔄", callback_data="refresh_stats", style="primary")]])
+    markup = InlineKeyboardMarkup([[InlineKeyboardButton("تحديث 🔄", callback_data="refresh_stats")]])
     if update.callback_query:
         await update.callback_query.answer("تم التحديث 🔄")
         try:
@@ -260,19 +280,56 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.edit_text(f"✅ تمت عملية الإذاعة بنجاح!\n\n- نجح الإرسال إلى: {success} مستخدم\n- فشل الإرسال إلى: {failed} مستخدم (قاموا بحظر البوت غالباً)")
 
 # ================== المعالجة والضغط الفائق السرعة ==================
-def _blocking_extract_info(url):
-    opts = {
-        'quiet': True, 
+
+# مجموعة User-Agents حديثة يتم التبديل بينها عشوائياً لتقليل احتمال الحظر من المنصات
+USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15',
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1',
+    'Mozilla/5.0 (Linux; Android 14; SM-S911B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36',
+]
+
+# رسائل أخطاء تدل على أن الفيديو محمي/محذوف/خاص بشكل نهائي، لا فائدة من إعادة المحاولة معها
+NON_RETRYABLE_MARKERS = [
+    "private video", "private account", "this video is unavailable", "video unavailable",
+    "sign in to confirm your age", "account has been terminated", "video has been removed",
+    "requires payment", "this content isn't available", "content isn't available",
+    "login required", "who has restricted", "unable to find video", "no video formats found",
+    "unsupported url", "copyright", "not available in your country",
+]
+
+def _get_common_ydl_opts():
+    """خيارات مشتركة تُستخدم في كل عمليات yt-dlp لتقليل نسبة الفشل والحظر."""
+    return {
+        'quiet': True,
         'no_warnings': True,
-        'extractor_args': {
-            'youtube': {'player_client': ['android', 'ios', 'mweb', 'web']},
-            'twitter': {'api': ['syndication']}
-        },
-        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'geo_bypass': True, 
+        'geo_bypass': True,
         'nocheckcertificate': True,
-        'socket_timeout': 15 
+        'noplaylist': True,
+        'check_formats': False,
+        'socket_timeout': 20,
+        'retries': 5,
+        'fragment_retries': 5,
+        'extractor_retries': 3,
+        # تحميل عدة أجزاء (fragments) بالتوازي يسرّع التحميل فعلياً لأنه اختناق شبكة
+        # وليس معالج (I/O-bound)، فهذا آمن تماماً ولا يرهق CPU/RAM على السيرفر المجاني
+        'concurrent_fragment_downloads': 4,
+        'user_agent': random.choice(USER_AGENTS),
+        'extractor_args': {
+            # ترتيب عملاء يوتيوب يقلل من ظهور رسالة "Sign in to confirm you're not a bot"
+            # ملاحظة: بعض المقاطع أصبحت يوتيوب تفرض عليها تسجيل دخول إجباري من جهتها
+            # ولا يوجد حل 100% بدون كوكيز لتلك الحالات تحديداً مهما كانت الإعدادات.
+            'youtube': {
+                'player_client': ['android', 'ios', 'tv_embedded', 'web_safari'],
+                'player_skip': ['webpage', 'configs'],
+            },
+            'tiktok': {'app_info': ['7355728856979712262']},
+        },
     }
+
+def _blocking_extract_info(url):
+    opts = _get_common_ydl_opts()
+    opts['socket_timeout'] = 15
     with YoutubeDL(opts) as ydl:
         return ydl.extract_info(url, download=False)
 
@@ -305,6 +362,53 @@ def _compress_video_sync(input_file, output_file):
         pass # حدث خطأ أو FFMPEG غير مثبت
     return input_file
 
+def _faststart_remux_sync(input_file, output_file):
+    """
+    يعيد ترتيب هيكل حاوية mp4 بحيث توضع بيانات moov في البداية (faststart).
+    هذا لا يعيد ترميز الفيديو إطلاقاً (-c copy = نسخ سريع جداً بدون أي عبء على المعالج)،
+    لكنه يحل مشكلة شائعة جداً: فيديوهات (خصوصاً من إنستغرام) لا تُحفظ بشكل سليم في معرض
+    الهاتف أو تظهر "تالفة" لأن بيانات moov موجودة بنهاية الملف بدل بدايته.
+    """
+    cmd = [
+        'ffmpeg', '-y', '-i', input_file,
+        '-c', 'copy',
+        '-movflags', '+faststart',
+        '-threads', '1',
+        output_file
+    ]
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT, timeout=60)
+        if os.path.exists(output_file) and os.path.getsize(output_file) > 0:
+            return output_file
+    except Exception:
+        pass
+    return input_file
+
+def _probe_video_metadata_sync(input_file):
+    """
+    يجلب المدة/العرض/الارتفاع بسرعة عبر ffprobe لتمريرها لتيليجرام مع الفيديو.
+    تزويد تيليجرام بهذه البيانات مسبقاً يسرّع عرض المقطع وبدء التشغيل عند المستلم
+    بدل ما يضطر تطبيق تيليجرام لتحليلها بنفسه بعد اكتمال الرفع.
+    """
+    try:
+        cmd = [
+            'ffprobe', '-v', 'error', '-select_streams', 'v:0',
+            '-show_entries', 'stream=width,height:format=duration',
+            '-of', 'json', input_file
+        ]
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=15)
+        data = json.loads(result.stdout.decode())
+        width = data.get('streams', [{}])[0].get('width')
+        height = data.get('streams', [{}])[0].get('height')
+        duration = data.get('format', {}).get('duration')
+        return (
+            int(float(duration)) if duration else None,
+            int(width) if width else None,
+            int(height) if height else None,
+        )
+    except Exception:
+        return None, None, None
+
 # ================== استقبال الرسائل والبدء ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -313,8 +417,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not await check_user_subscription(context.bot, user.id):
         markup = InlineKeyboardMarkup([
-            [InlineKeyboardButton("اشترك في القناة 📡", url=f"https://t.me/{CHANNEL.lstrip('@')}", style="primary")],
-            [InlineKeyboardButton("تحقق 🔍", callback_data="check_sub", style="success")]
+            [InlineKeyboardButton("اشترك في القناة 📡", url=f"https://t.me/{CHANNEL.lstrip('@')}")],
+            [InlineKeyboardButton("تحقق 🔍", callback_data="check_sub")]
         ])
         await update.message.reply_text("🚧 عذراً، يجب الاشتراك بالقناة أولاً لاستخدام البوت.", reply_markup=markup)
         return
@@ -323,11 +427,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def check_sub_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    await q.answer()
+    # ملاحظة: لا يمكن استدعاء q.answer() أكثر من مرة واحدة لكل ضغطة زر،
+    # لذلك نتحقق أولاً من حالة الاشتراك ثم نستدعي answer() مرة واحدة فقط بالشكل المناسب.
     if await check_user_subscription(context.bot, q.from_user.id):
-        await q.message.delete()
+        await q.answer("✅ تم التحقق بنجاح!")
+        try:
+            await q.message.delete()
+        except Exception:
+            pass
         await q.message.reply_text("✅ تم التحقق! أرسل رابطك أو كلمة البحث الآن.")
     else:
+        # فقط تنبيه منبثق (Popup) بدون أي رسالة إضافية داخل المحادثة
         await q.answer("❌ لم تشترك بالقناة بعد!", show_alert=True)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -336,7 +446,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     track_user_activity(user.id)
 
     if not await check_user_subscription(context.bot, user.id):
-        await update.message.reply_text("🚧 يرجى الاشتراك في القناة أولاً.")
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("اشترك في القناة 📡", url=f"https://t.me/{CHANNEL.lstrip('@')}")],
+            [InlineKeyboardButton("تحقق 🔍", callback_data="check_sub")]
+        ])
+        await update.message.reply_text("🚧 يرجى الاشتراك في القناة أولاً.", reply_markup=markup)
         return
 
     text = update.message.text.strip()
@@ -391,10 +505,10 @@ def build_search_page(sid, page):
     
     buttons = []
     if end_idx < total:
-        buttons.append(InlineKeyboardButton("التالي »", callback_data=f"page_{sid}_{page+1}", style="primary"))
+        buttons.append(InlineKeyboardButton("التالي »", callback_data=f"page_{sid}_{page+1}"))
     if page > 0:
-        buttons.append(InlineKeyboardButton("« السابق", callback_data=f"page_{sid}_{page-1}", style="primary"))
-        
+        buttons.append(InlineKeyboardButton("« السابق", callback_data=f"page_{sid}_{page-1}"))
+
     markup = InlineKeyboardMarkup([buttons]) if buttons else None
     return text, markup
 
@@ -417,7 +531,7 @@ async def perform_youtube_search(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     sid = str(uuid.uuid4())[:8]
-    SEARCH_CACHE[sid] = {'query': query, 'entries': entries}
+    cache_search(sid, {'query': query, 'entries': entries})
     
     text, markup = build_search_page(sid, 0)
     await msg.edit_text(text, parse_mode="HTML", reply_markup=markup)
@@ -466,13 +580,13 @@ async def process_link_info(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         uploader = "الرابط المرفق"
 
     sid = str(uuid.uuid4())[:8]
-    URL_CACHE[sid] = url
+    cache_url(sid, url)
 
     caption = f"🎬 <b>{title}</b>\n👤 المصدر: {uploader}"
     markup = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎥 فيديو MP4", callback_data=f"down_vid_{sid}", style="primary")],
-        [InlineKeyboardButton("🎵 صوت MP3", callback_data=f"down_aud_{sid}", style="success"),
-         InlineKeyboardButton("🎙 بصمة صوتية", callback_data=f"down_voc_{sid}", style="success")]
+        [InlineKeyboardButton("🎥 فيديو MP4", callback_data=f"down_vid_{sid}")],
+        [InlineKeyboardButton("🎵 صوت MP3", callback_data=f"down_aud_{sid}"),
+         InlineKeyboardButton("🎙 بصمة صوتية", callback_data=f"down_voc_{sid}")]
     ])
 
     await msg.delete()
@@ -503,43 +617,41 @@ async def download_action_callback(update: Update, context: ContextTypes.DEFAULT
         out_tmpl = f"zendown_{sid}.%(ext)s"
         
         if action == "vid":
-            opts = {
-                'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+            opts = _get_common_ydl_opts()
+            opts.update({
+                # الأولوية دائماً لترميز H.264 (avc1) + AAC (m4a) لأنه المتوافق 100% مع
+                # معارض الصور بكل أنواع الهواتف. الخيارات الأخيرة (bv*+ba/b) احتياطية فقط
+                # لحالات نادرة مثل سلايدشو تيك توك، لتفادي الكراش بدون التضحية بالتوافقية.
+                'format': (
+                    'bestvideo[vcodec^=avc1][ext=mp4]+bestaudio[acodec^=mp4a][ext=m4a]/'
+                    'best[vcodec^=avc1][ext=mp4]/'
+                    'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/'
+                    'bv*+ba/b'
+                ),
                 'outtmpl': out_tmpl,
-                'quiet': True,
-                'no_warnings': True,
-                'geo_bypass': True,
-                'nocheckcertificate': True,
-                'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-                'extractor_args': {
-                    'youtube': {'player_client': ['android', 'ios', 'web']},
-                    'twitter': {'api': ['syndication']}
-                }
-            }
+                'merge_output_format': 'mp4',
+            })
         elif action == "aud":
-            opts = {
+            opts = _get_common_ydl_opts()
+            opts.update({
                 'format': 'bestaudio/best',
                 'outtmpl': out_tmpl,
                 'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'}],
-                'quiet': True,
-                'no_warnings': True,
-                'geo_bypass': True,
-                'nocheckcertificate': True
-            }
+            })
         else:
-            opts = {
+            opts = _get_common_ydl_opts()
+            opts.update({
                 'format': 'bestaudio/best',
                 'outtmpl': out_tmpl,
                 'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'vorbis'}],
-                'quiet': True,
-                'no_warnings': True,
-                'geo_bypass': True,
-                'nocheckcertificate': True
-            }
+            })
 
         file_path = None
-        max_retries = 3 
+        downloaded_path = None  # يحتفظ بمسار الملف الأصلي كما هو حتى لو تغيّر file_path لاحقاً بعد الضغط
+        temp_paths = set()  # كل نسخة وسيطة (مضغوطة/معاد ترتيبها) تُسجّل هنا لضمان حذفها لاحقاً
+        max_retries = 3
         success_download = False
+        last_error = None
 
         for attempt in range(max_retries):
             try:
@@ -548,24 +660,46 @@ async def download_action_callback(update: Update, context: ContextTypes.DEFAULT
                 if action == "voc": file_path = file_path.rsplit('.', 1)[0] + '.ogg'
                 
                 if os.path.exists(file_path):
+                    downloaded_path = file_path
                     success_download = True
                     break
             except Exception as e:
+                last_error = str(e)
+                err_str = last_error.lower()
                 logger.error(f"Attempt {attempt + 1} failed: {e}")
+
+                # لو الخطأ يدل على أن الفيديو محمي/خاص/محذوف نهائياً، لا فائدة من إعادة المحاولة
+                if any(marker in err_str for marker in NON_RETRYABLE_MARKERS):
+                    break
+
                 if attempt < max_retries - 1:
                     await status_msg.edit_text(f"⚠️ جاري المحاولة مرة أخرى ({attempt + 2}/{max_retries})...")
                     await asyncio.sleep(2) 
                 else:
                     pass
 
+        duration = width = height = None
+
         try:
             if success_download and file_path and os.path.exists(file_path):
                 
+                # إعادة ترتيب حاوية mp4 (faststart) لكل فيديو — نسخ سريع بدون إعادة ترميز،
+                # يحل مشكلة عدم حفظ المقطع بشكل سليم في معرض الهاتف (خصوصاً إنستغرام)
+                if action == "vid":
+                    fs_path = file_path.rsplit('.', 1)[0] + '_fs.mp4'
+                    remuxed = await asyncio.to_thread(_faststart_remux_sync, file_path, fs_path)
+                    if remuxed != file_path:
+                        temp_paths.add(remuxed)
+                        file_path = remuxed
+
                 # مرحلة الضغط
                 if action == "vid" and (os.path.getsize(file_path) / (1024*1024)) > 45:
                     await status_msg.edit_text("🗜 حجم المقطع كبير.. جاري الضغط السريع (قد يستغرق دقيقتين)...")
                     comp_path = file_path.rsplit('.', 1)[0] + '_c.mp4'
-                    file_path = await asyncio.to_thread(_compress_video_sync, file_path, comp_path)
+                    compressed = await asyncio.to_thread(_compress_video_sync, file_path, comp_path)
+                    if compressed != file_path:
+                        temp_paths.add(compressed)
+                        file_path = compressed
 
                 # جدار حماية تيليجرام: فحص الحجم النهائي لمنع التعليق الوهمي أثناء الرفع
                 final_size_mb = os.path.getsize(file_path) / (1024 * 1024)
@@ -574,9 +708,17 @@ async def download_action_callback(update: Update, context: ContextTypes.DEFAULT
                     track_download_status(False)
                     return # نخرج من العملية فوراً
 
+                # جلب المدة/الأبعاد لتسريع عرض المقطع عند المستلم (اختياري، بدون تعطيل الإرسال لو فشل)
+                if action == "vid":
+                    duration, width, height = await asyncio.to_thread(_probe_video_metadata_sync, file_path)
+
                 await status_msg.edit_text("📤 جاري إرسال الملف...")
                 with open(file_path, 'rb') as f:
-                    if action == "vid": await q.message.reply_video(video=f, caption="🎬 تم بواسطة @ZenDown_Bot", supports_streaming=True)
+                    if action == "vid":
+                        await q.message.reply_video(
+                            video=f, caption="🎬 تم بواسطة @ZenDown_Bot", supports_streaming=True,
+                            duration=duration, width=width, height=height,
+                        )
                     elif action == "aud": await q.message.reply_audio(audio=f, caption="🎵 تم بواسطة @ZenDown_Bot")
                     elif action == "voc": await q.message.reply_voice(voice=f, caption="🎙 تم بواسطة @ZenDown_Bot")
 
@@ -584,19 +726,37 @@ async def download_action_callback(update: Update, context: ContextTypes.DEFAULT
                 await status_msg.delete()
             else:
                 track_download_status(False)
-                await status_msg.edit_text("❌ حدث خطأ أثناء التحميل، قد يكون المقطع محمي كلياً أو يحتاج تسجيلاً إجبارياً.")
+                if q.from_user.id == ADMIN_ID and last_error:
+                    # للأدمن فقط: نعرض نص الخطأ الحقيقي القادم من yt-dlp عشان نشخص بدقة بدل التخمين
+                    short_err = last_error[:350]
+                    await status_msg.edit_text(f"❌ فشل التحميل.\n\n🔧 تفاصيل تقنية (للأدمن فقط):\n<code>{short_err}</code>", parse_mode="HTML")
+                else:
+                    await status_msg.edit_text("❌ حدث خطأ أثناء التحميل، قد يكون المقطع محمي كلياً أو يحتاج تسجيلاً إجبارياً.")
         except Exception as e:
             logger.error(f"Send Error: {e}")
             track_download_status(False)
             await status_msg.edit_text("❌ حدث خطأ أثناء معالجة وإرسال الملف.")
         finally:
-            if file_path and os.path.exists(file_path):
-                try: os.remove(file_path)
-                except Exception: pass
+            # نحذف الملف الأصلي وكل نسخة وسيطة (معاد ترتيبها/مضغوطة) لمنع تراكم الملفات على القرص
+            paths_to_clean = {p for p in ({file_path, downloaded_path} | temp_paths) if p}
+            for p in paths_to_clean:
+                if os.path.exists(p):
+                    try: os.remove(p)
+                    except Exception: pass
 
 # ================== التشغيل الرئيسي ==================
 def main():
-    app = ApplicationBuilder().token(TOKEN).concurrent_updates(True).build()
+    # مهلات أطول من الافتراضي لضمان اكتمال رفع الفيديوهات الكبيرة دون فشل/انقطاع مبكر
+    app = (
+        ApplicationBuilder()
+        .token(TOKEN)
+        .concurrent_updates(True)
+        .connect_timeout(20)
+        .read_timeout(60)
+        .write_timeout(60)
+        .pool_timeout(20)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("broadcast", broadcast_command))
@@ -617,6 +777,8 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
 
 
 
