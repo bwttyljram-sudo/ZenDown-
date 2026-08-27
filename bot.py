@@ -18,13 +18,30 @@ from telegram.ext import (
 # تحديث تلقائي لمكتبة yt-dlp
 try:
     print("🔄 جاري التحقق من تحديثات yt-dlp...")
-    subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", "yt-dlp[default]"], 
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    print("✅ yt-dlp محدث لأحدث إصدار!")
+    result = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "--upgrade", "yt-dlp[default]"],
+        capture_output=True, text=True
+    )
+    if result.returncode == 0:
+        print("✅ yt-dlp محدث لأحدث إصدار!")
+    else:
+        print("❌ فشل تثبيت yt-dlp[default] فعلياً! الخطأ الحقيقي:")
+        print(result.stderr[-3000:])
 except Exception as e:
     print(f"⚠️ فشل التحديث التلقائي: {e}")
 
 from yt_dlp import YoutubeDL
+
+# طباعة نسخ yt-dlp و yt-dlp-ejs الفعلية المثبتة - عشان نتأكد بيقين هل ejs موجودة ولا لا
+try:
+    import importlib.metadata as _im
+    print(f"📦 نسخة yt-dlp المثبتة فعلياً: {_im.version('yt-dlp')}")
+except Exception as e:
+    print(f"⚠️ تعذر قراءة نسخة yt-dlp: {e}")
+try:
+    print(f"📦 نسخة yt-dlp-ejs المثبتة فعلياً: {_im.version('yt-dlp-ejs')}")
+except Exception as e:
+    print(f"❌ yt-dlp-ejs غير مثبتة إطلاقاً! السبب: {e}")
 
 # تثبيت/تحديث Deno تلقائياً - تيك توك صار يطلب حل تحدي جافاسكريبت (JS challenge)
 # و yt-dlp يحتاج Deno مثبت على السيرفر عشان يحله وإلا التحميل من تيك توك يفشل بصمت
@@ -74,6 +91,15 @@ logger = logging.getLogger("ZenDown_Bot")
 TOKEN = os.environ.get("BOT_TOKEN")
 CHANNEL = "@ZenoX_Tools"
 ADMIN_ID = 6043858925
+
+# ملف كوكيز اختياري - لو رفعته كـ Secret File بـ Render باسم cookies.txt
+# بيُستخدم تلقائياً لتجاوز حظر تيك توك، بدون أي تعديل إضافي بالكود
+COOKIES_FILE = "/etc/secrets/cookies.txt"
+COOKIES_FILE = COOKIES_FILE if os.path.exists(COOKIES_FILE) else None
+if COOKIES_FILE:
+    print("🍪 تم العثور على ملف كوكيز، سيتم استخدامه لتحسين التحميل من تيك توك.")
+else:
+    print("ℹ️ لا يوجد ملف كوكيز حالياً (اختياري).")
 
 # أقصى عدد تحميلات متزامنة لحماية الموارد (تحميل فقط - لا يشمل الضغط)
 MAX_CONCURRENT_DOWNLOADS = 4
@@ -288,6 +314,7 @@ def _blocking_extract_info(url):
     opts = {
         'quiet': True, 
         'no_warnings': True,
+        'cookiefile': COOKIES_FILE,
         'extractor_args': {
             'youtube': {'player_client': ['android', 'ios', 'mweb', 'web']},
             'twitter': {'api': ['syndication']},
@@ -305,6 +332,35 @@ def _blocking_download(url, opts):
     with YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
         return ydl.prepare_filename(info)
+
+def _blocking_tiktok_via_tikwm(url, out_path, want_audio=False):
+    """
+    مسار بديل مخصص لتيك توك فقط: يطلب رابط التحميل المباشر من خدمة وسيطة مجانية (TikWM)
+    بدل ما yt-dlp يحاول يتفاوض مع تيك توك مباشرة ويصطدم بالحظر/التحدي.
+    يرجع مسار الملف لو نجح، أو يرمي Exception لو فشل (وبعدها البوت يرجع للطريقة القديمة تلقائياً).
+    """
+    api_url = "https://www.tikwm.com/api/?url=" + urllib.request.quote(url, safe="")
+    req = urllib.request.Request(api_url, headers={'User-Agent': 'Mozilla/5.0'})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        data = json.loads(resp.read().decode())
+
+    if data.get("code") != 0 or "data" not in data:
+        raise Exception(f"TikWM API error: {data.get('msg', 'unknown')}")
+
+    media_url = data["data"].get("music") if want_audio else (data["data"].get("play") or data["data"].get("hdplay"))
+    if not media_url:
+        raise Exception("TikWM: لا يوجد رابط فيديو/صوت بالرد")
+
+    if media_url.startswith("/"):
+        media_url = "https://www.tikwm.com" + media_url
+
+    dl_req = urllib.request.Request(media_url, headers={'User-Agent': 'Mozilla/5.0'})
+    with urllib.request.urlopen(dl_req, timeout=60) as resp, open(out_path, "wb") as f:
+        f.write(resp.read())
+
+    if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+        return out_path
+    raise Exception("TikWM: الملف الناتج فارغ")
 
 def _compress_video_sync(input_file, output_file):
     cmd = [
@@ -528,6 +584,7 @@ async def download_action_callback(update: Update, context: ContextTypes.DEFAULT
             'outtmpl': out_tmpl,
             'quiet': True,
             'no_warnings': True,
+            'cookiefile': COOKIES_FILE,
             'geo_bypass': True,
             'nocheckcertificate': True,
             'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
@@ -544,6 +601,7 @@ async def download_action_callback(update: Update, context: ContextTypes.DEFAULT
             'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'}],
             'quiet': True,
             'no_warnings': True,
+            'cookiefile': COOKIES_FILE,
             'geo_bypass': True,
             'nocheckcertificate': True,
             'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
@@ -555,6 +613,7 @@ async def download_action_callback(update: Update, context: ContextTypes.DEFAULT
             'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'vorbis'}],
             'quiet': True,
             'no_warnings': True,
+            'cookiefile': COOKIES_FILE,
             'geo_bypass': True,
             'nocheckcertificate': True,
             'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
@@ -563,27 +622,43 @@ async def download_action_callback(update: Update, context: ContextTypes.DEFAULT
     file_path = None
     max_retries = 3
     success_download = False
+    is_tiktok = "tiktok.com" in url.lower()
 
     # === مرحلة التحميل فقط - يتحرر السيمافور فور انتهاء التحميل ===
     # ده بيسمح لمستخدمين تانيين يبدأوا تحميلهم فوراً حتى لو واحد لسه بيضغط فيديوه
     async with DOWNLOAD_SEMAPHORE:
         await status_msg.edit_text("🚀 جاري التحميل...")
-        for attempt in range(max_retries):
-            try:
-                file_path = await asyncio.to_thread(_blocking_download, url, opts)
-                if action == "aud": file_path = file_path.rsplit('.', 1)[0] + '.mp3'
-                if action == "voc": file_path = file_path.rsplit('.', 1)[0] + '.ogg'
 
+        # مسار تيك توك المخصص أولاً (يتجاوز مشكلة الحظر/التحدي غالباً)
+        if is_tiktok and action in ("vid", "aud"):
+            try:
+                tikwm_out = f"zendown_{sid}_tikwm.{'mp3' if action == 'aud' else 'mp4'}"
+                file_path = await asyncio.to_thread(
+                    _blocking_tiktok_via_tikwm, url, tikwm_out, action == "aud"
+                )
                 if os.path.exists(file_path):
                     success_download = True
-                    break
             except Exception as e:
-                logger.error(f"Attempt {attempt + 1} failed: {e}")
-                if attempt < max_retries - 1:
-                    await status_msg.edit_text(f"⚠️ جاري المحاولة مرة أخرى ({attempt + 2}/{max_retries})...")
-                    await asyncio.sleep(2)
-                else:
-                    pass
+                logger.error(f"TikWM fallback failed: {e}")
+                file_path = None
+
+        if not success_download:
+            for attempt in range(max_retries):
+                try:
+                    file_path = await asyncio.to_thread(_blocking_download, url, opts)
+                    if action == "aud": file_path = file_path.rsplit('.', 1)[0] + '.mp3'
+                    if action == "voc": file_path = file_path.rsplit('.', 1)[0] + '.ogg'
+
+                    if os.path.exists(file_path):
+                        success_download = True
+                        break
+                except Exception as e:
+                    logger.error(f"Attempt {attempt + 1} failed: {e}")
+                    if attempt < max_retries - 1:
+                        await status_msg.edit_text(f"⚠️ جاري المحاولة مرة أخرى ({attempt + 2}/{max_retries})...")
+                        await asyncio.sleep(2)
+                    else:
+                        pass
 
     # === مرحلة الضغط والإرسال - خارج طابور التحميل، تحت سيمافور مستقل ===
     try:
@@ -646,7 +721,119 @@ def main():
 
 if __name__ == "__main__":
     main()
+import subprocess
+import sys
+import asyncio
+import logging
+import os
+import uuid
+import threading
+import json
+import urllib.request
+import time
+from datetime import datetime, timedelta
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import (
+    ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, CallbackQueryHandler, filters
+)
 
+# تحديث تلقائي لمكتبة yt-dlp
+try:
+    print("🔄 جاري التحقق من تحديثات yt-dlp...")
+    result = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "--upgrade", "yt-dlp[default]"],
+        capture_output=True, text=True
+    )
+    if result.returncode == 0:
+        print("✅ yt-dlp محدث لأحدث إصدار!")
+    else:
+        print("❌ فشل تثبيت yt-dlp[default] فعلياً! الخطأ الحقيقي:")
+        print(result.stderr[-3000:])
+except Exception as e:
+    print(f"⚠️ فشل التحديث التلقائي: {e}")
+
+from yt_dlp import YoutubeDL
+
+# طباعة نسخ yt-dlp و yt-dlp-ejs الفعلية المثبتة - عشان نتأكد بيقين هل ejs موجودة ولا لا
+try:
+    import importlib.metadata as _im
+    print(f"📦 نسخة yt-dlp المثبتة فعلياً: {_im.version('yt-dlp')}")
+except Exception as e:
+    print(f"⚠️ تعذر قراءة نسخة yt-dlp: {e}")
+try:
+    print(f"📦 نسخة yt-dlp-ejs المثبتة فعلياً: {_im.version('yt-dlp-ejs')}")
+except Exception as e:
+    print(f"❌ yt-dlp-ejs غير مثبتة إطلاقاً! السبب: {e}")
+
+# تثبيت/تحديث Deno تلقائياً - تيك توك صار يطلب حل تحدي جافاسكريبت (JS challenge)
+# و yt-dlp يحتاج Deno مثبت على السيرفر عشان يحله وإلا التحميل من تيك توك يفشل بصمت
+try:
+    deno_check = subprocess.run(["deno", "--version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if deno_check.returncode != 0:
+        raise FileNotFoundError
+    print("✅ Deno متوفر بالفعل.")
+except Exception:
+    try:
+        print("🔄 Deno غير موجود، جاري تثبيته (مطلوب لتحميل تيك توك)...")
+        subprocess.run(
+            "curl -fsSL https://deno.land/install.sh | sh -s -- -y",
+            shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120
+        )
+        deno_bin = os.path.expanduser("~/.deno/bin")
+        os.environ["PATH"] = deno_bin + os.pathsep + os.environ.get("PATH", "")
+        print("✅ تم تثبيت Deno.")
+    except Exception as e:
+        print(f"⚠️ تعذر تثبيت Deno تلقائياً: {e} — تحميل تيك توك قد يستمر بالفشل حتى يُثبَّت يدوياً.")
+
+# ================== سيرفر الصحة لإرضاء المنصة (Render/UptimeRobot) ==================
+class DummyHealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"ZenDown_Bot is Running!")
+        
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
+
+    def log_message(self, format, *args):
+        return
+
+def start_dummy_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), DummyHealthCheckHandler)
+    server.serve_forever()
+
+threading.Thread(target=start_dummy_server, daemon=True).start()
+
+# ================== الإعدادات والتكوين ==================
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
+logger = logging.getLogger("ZenDown_Bot")
+
+TOKEN = os.environ.get("BOT_TOKEN")
+CHANNEL = "@ZenoX_Tools"
+ADMIN_ID = 6043858925
+
+# ملف كوكيز اختياري - لو رفعته كـ Secret File بـ Render باسم cookies.txt
+# بيُستخدم تلقائياً لتجاوز حظر تيك توك، بدون أي تعديل إضافي بالكود
+COOKIES_FILE = "/etc/secrets/cookies.txt"
+COOKIES_FILE = COOKIES_FILE if os.path.exists(COOKIES_FILE) else None
+if COOKIES_FILE:
+    print("🍪 تم العثور على ملف كوكيز، سيتم استخدامه لتحسين التحميل من تيك توك.")
+else:
+    print("ℹ️ لا يوجد ملف كوكيز حالياً (اختياري).")
+
+# أقصى عدد تحميلات متزامنة لحماية الموارد (تحميل فقط - لا يشمل الضغط)
+MAX_CONCURRENT_DOWNLOADS = 4
+DOWNLOAD_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
+
+# سيمافور منفصل للضغط فقط - عشان ما يوقفش باقي المستخدمين وهم بس بيحملوا
+MAX_CONCURRENT_COMPRESSIONS = 2
+COMPRESS_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_COMPRESSIONS)
+
+# ذاكرة مؤقتة
+SEARCH_CACHE = {}
 URL_CACHE = {}
 
 # ================== نظام الإحصائيات ==================
@@ -850,6 +1037,7 @@ def _blocking_extract_info(url):
     opts = {
         'quiet': True, 
         'no_warnings': True,
+        'cookiefile': COOKIES_FILE,
         'extractor_args': {
             'youtube': {'player_client': ['android', 'ios', 'mweb', 'web']},
             'twitter': {'api': ['syndication']},
@@ -867,6 +1055,35 @@ def _blocking_download(url, opts):
     with YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
         return ydl.prepare_filename(info)
+
+def _blocking_tiktok_via_tikwm(url, out_path, want_audio=False):
+    """
+    مسار بديل مخصص لتيك توك فقط: يطلب رابط التحميل المباشر من خدمة وسيطة مجانية (TikWM)
+    بدل ما yt-dlp يحاول يتفاوض مع تيك توك مباشرة ويصطدم بالحظر/التحدي.
+    يرجع مسار الملف لو نجح، أو يرمي Exception لو فشل (وبعدها البوت يرجع للطريقة القديمة تلقائياً).
+    """
+    api_url = "https://www.tikwm.com/api/?url=" + urllib.request.quote(url, safe="")
+    req = urllib.request.Request(api_url, headers={'User-Agent': 'Mozilla/5.0'})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        data = json.loads(resp.read().decode())
+
+    if data.get("code") != 0 or "data" not in data:
+        raise Exception(f"TikWM API error: {data.get('msg', 'unknown')}")
+
+    media_url = data["data"].get("music") if want_audio else (data["data"].get("play") or data["data"].get("hdplay"))
+    if not media_url:
+        raise Exception("TikWM: لا يوجد رابط فيديو/صوت بالرد")
+
+    if media_url.startswith("/"):
+        media_url = "https://www.tikwm.com" + media_url
+
+    dl_req = urllib.request.Request(media_url, headers={'User-Agent': 'Mozilla/5.0'})
+    with urllib.request.urlopen(dl_req, timeout=60) as resp, open(out_path, "wb") as f:
+        f.write(resp.read())
+
+    if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+        return out_path
+    raise Exception("TikWM: الملف الناتج فارغ")
 
 def _compress_video_sync(input_file, output_file):
     cmd = [
@@ -1090,6 +1307,7 @@ async def download_action_callback(update: Update, context: ContextTypes.DEFAULT
             'outtmpl': out_tmpl,
             'quiet': True,
             'no_warnings': True,
+            'cookiefile': COOKIES_FILE,
             'geo_bypass': True,
             'nocheckcertificate': True,
             'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
@@ -1106,6 +1324,7 @@ async def download_action_callback(update: Update, context: ContextTypes.DEFAULT
             'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'}],
             'quiet': True,
             'no_warnings': True,
+            'cookiefile': COOKIES_FILE,
             'geo_bypass': True,
             'nocheckcertificate': True,
             'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
@@ -1117,6 +1336,7 @@ async def download_action_callback(update: Update, context: ContextTypes.DEFAULT
             'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'vorbis'}],
             'quiet': True,
             'no_warnings': True,
+            'cookiefile': COOKIES_FILE,
             'geo_bypass': True,
             'nocheckcertificate': True,
             'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
@@ -1125,27 +1345,43 @@ async def download_action_callback(update: Update, context: ContextTypes.DEFAULT
     file_path = None
     max_retries = 3
     success_download = False
+    is_tiktok = "tiktok.com" in url.lower()
 
     # === مرحلة التحميل فقط - يتحرر السيمافور فور انتهاء التحميل ===
     # ده بيسمح لمستخدمين تانيين يبدأوا تحميلهم فوراً حتى لو واحد لسه بيضغط فيديوه
     async with DOWNLOAD_SEMAPHORE:
         await status_msg.edit_text("🚀 جاري التحميل...")
-        for attempt in range(max_retries):
-            try:
-                file_path = await asyncio.to_thread(_blocking_download, url, opts)
-                if action == "aud": file_path = file_path.rsplit('.', 1)[0] + '.mp3'
-                if action == "voc": file_path = file_path.rsplit('.', 1)[0] + '.ogg'
 
+        # مسار تيك توك المخصص أولاً (يتجاوز مشكلة الحظر/التحدي غالباً)
+        if is_tiktok and action in ("vid", "aud"):
+            try:
+                tikwm_out = f"zendown_{sid}_tikwm.{'mp3' if action == 'aud' else 'mp4'}"
+                file_path = await asyncio.to_thread(
+                    _blocking_tiktok_via_tikwm, url, tikwm_out, action == "aud"
+                )
                 if os.path.exists(file_path):
                     success_download = True
-                    break
             except Exception as e:
-                logger.error(f"Attempt {attempt + 1} failed: {e}")
-                if attempt < max_retries - 1:
-                    await status_msg.edit_text(f"⚠️ جاري المحاولة مرة أخرى ({attempt + 2}/{max_retries})...")
-                    await asyncio.sleep(2)
-                else:
-                    pass
+                logger.error(f"TikWM fallback failed: {e}")
+                file_path = None
+
+        if not success_download:
+            for attempt in range(max_retries):
+                try:
+                    file_path = await asyncio.to_thread(_blocking_download, url, opts)
+                    if action == "aud": file_path = file_path.rsplit('.', 1)[0] + '.mp3'
+                    if action == "voc": file_path = file_path.rsplit('.', 1)[0] + '.ogg'
+
+                    if os.path.exists(file_path):
+                        success_download = True
+                        break
+                except Exception as e:
+                    logger.error(f"Attempt {attempt + 1} failed: {e}")
+                    if attempt < max_retries - 1:
+                        await status_msg.edit_text(f"⚠️ جاري المحاولة مرة أخرى ({attempt + 2}/{max_retries})...")
+                        await asyncio.sleep(2)
+                    else:
+                        pass
 
     # === مرحلة الضغط والإرسال - خارج طابور التحميل، تحت سيمافور مستقل ===
     try:
@@ -1208,7 +1444,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
 
 
