@@ -89,6 +89,23 @@ threading.Thread(target=start_dummy_server, daemon=True).start()
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger("ZenDown_Bot")
 
+# ذاكرة تخزن آخر الأخطاء - عشان الأدمن يشوفها من داخل تيليجرام بدون الدخول لـ Render
+from collections import deque
+RECENT_ERRORS = deque(maxlen=15)
+
+class _ErrorCaptureHandler(logging.Handler):
+    def emit(self, record):
+        if record.levelno >= logging.ERROR:
+            try:
+                msg = self.format(record)
+                RECENT_ERRORS.append(f"{datetime.now().strftime('%H:%M:%S')} - {msg[:300]}")
+            except Exception:
+                pass
+
+_error_handler = _ErrorCaptureHandler()
+_error_handler.setFormatter(logging.Formatter("%(message)s"))
+logging.getLogger().addHandler(_error_handler)  # يلتقط من كل اللوقرز، مو بس بتاعنا
+
 TOKEN = os.environ.get("BOT_TOKEN")
 CHANNEL = "@ZenoX_Tools"
 ADMIN_ID = 6043858925
@@ -112,11 +129,11 @@ else:
     print("ℹ️ لا يوجد بروكسي مُعرّف حالياً (اختياري).")
 
 # أقصى عدد تحميلات متزامنة لحماية الموارد (تحميل فقط - لا يشمل الضغط)
-MAX_CONCURRENT_DOWNLOADS = 4
+MAX_CONCURRENT_DOWNLOADS = 2
 DOWNLOAD_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 
 # سيمافور منفصل للضغط فقط - عشان ما يوقفش باقي المستخدمين وهم بس بيحملوا
-MAX_CONCURRENT_COMPRESSIONS = 2
+MAX_CONCURRENT_COMPRESSIONS = 1
 COMPRESS_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_COMPRESSIONS)
 
 # ذاكرة مؤقتة
@@ -187,6 +204,27 @@ async def check_user_subscription(bot, user_id: int) -> bool:
         return member.status in ["member", "administrator", "creator"]
     except Exception:
         return False
+
+# ================== عرض آخر الأخطاء (للأدمن فقط) ==================
+async def show_errors_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or user.id != ADMIN_ID:
+        return
+
+    if not RECENT_ERRORS:
+        await update.message.reply_text("✅ ما فيه أي أخطاء مسجلة منذ آخر تشغيل للبوت.")
+        return
+
+    text = "🛑 <b>آخر الأخطاء المسجلة</b>\n━━━━━━━\n\n"
+    for i, err in enumerate(reversed(RECENT_ERRORS), 1):
+        # هروب من رموز HTML عشان ما يكسر تنسيق الرسالة
+        safe_err = err.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        text += f"{i}. <code>{safe_err}</code>\n\n"
+        if len(text) > 3500:  # حد أقصى تقريبي لرسالة تيليجرام
+            text += "... (يوجد المزيد، هذا آخر جزء ظاهر)"
+            break
+
+    await update.message.reply_text(text, parse_mode="HTML")
 
 # ================== لوحة الإحصائيات ==================
 async def show_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -746,6 +784,8 @@ def main():
     app.add_handler(CallbackQueryHandler(search_page_callback, pattern="^page_")) 
     
     app.add_handler(CommandHandler("stats", show_stats_command))
+    app.add_handler(CommandHandler("errors", show_errors_command))
+    app.add_handler(MessageHandler(filters.Regex(r"^(اخطاء|أخطاء)$"), show_errors_command))
     app.add_handler(MessageHandler(filters.Regex(r"^(احصائيات|إحصائيات)$"), show_stats_command))
     app.add_handler(CallbackQueryHandler(show_stats_command, pattern="^refresh_stats$"))
 
@@ -849,6 +889,23 @@ threading.Thread(target=start_dummy_server, daemon=True).start()
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger("ZenDown_Bot")
 
+# ذاكرة تخزن آخر الأخطاء - عشان الأدمن يشوفها من داخل تيليجرام بدون الدخول لـ Render
+from collections import deque
+RECENT_ERRORS = deque(maxlen=15)
+
+class _ErrorCaptureHandler(logging.Handler):
+    def emit(self, record):
+        if record.levelno >= logging.ERROR:
+            try:
+                msg = self.format(record)
+                RECENT_ERRORS.append(f"{datetime.now().strftime('%H:%M:%S')} - {msg[:300]}")
+            except Exception:
+                pass
+
+_error_handler = _ErrorCaptureHandler()
+_error_handler.setFormatter(logging.Formatter("%(message)s"))
+logging.getLogger().addHandler(_error_handler)  # يلتقط من كل اللوقرز، مو بس بتاعنا
+
 TOKEN = os.environ.get("BOT_TOKEN")
 CHANNEL = "@ZenoX_Tools"
 ADMIN_ID = 6043858925
@@ -872,11 +929,11 @@ else:
     print("ℹ️ لا يوجد بروكسي مُعرّف حالياً (اختياري).")
 
 # أقصى عدد تحميلات متزامنة لحماية الموارد (تحميل فقط - لا يشمل الضغط)
-MAX_CONCURRENT_DOWNLOADS = 4
+MAX_CONCURRENT_DOWNLOADS = 2
 DOWNLOAD_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 
 # سيمافور منفصل للضغط فقط - عشان ما يوقفش باقي المستخدمين وهم بس بيحملوا
-MAX_CONCURRENT_COMPRESSIONS = 2
+MAX_CONCURRENT_COMPRESSIONS = 1
 COMPRESS_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_COMPRESSIONS)
 
 # ذاكرة مؤقتة
@@ -947,6 +1004,27 @@ async def check_user_subscription(bot, user_id: int) -> bool:
         return member.status in ["member", "administrator", "creator"]
     except Exception:
         return False
+
+# ================== عرض آخر الأخطاء (للأدمن فقط) ==================
+async def show_errors_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or user.id != ADMIN_ID:
+        return
+
+    if not RECENT_ERRORS:
+        await update.message.reply_text("✅ ما فيه أي أخطاء مسجلة منذ آخر تشغيل للبوت.")
+        return
+
+    text = "🛑 <b>آخر الأخطاء المسجلة</b>\n━━━━━━━\n\n"
+    for i, err in enumerate(reversed(RECENT_ERRORS), 1):
+        # هروب من رموز HTML عشان ما يكسر تنسيق الرسالة
+        safe_err = err.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        text += f"{i}. <code>{safe_err}</code>\n\n"
+        if len(text) > 3500:  # حد أقصى تقريبي لرسالة تيليجرام
+            text += "... (يوجد المزيد، هذا آخر جزء ظاهر)"
+            break
+
+    await update.message.reply_text(text, parse_mode="HTML")
 
 # ================== لوحة الإحصائيات ==================
 async def show_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1506,6 +1584,8 @@ def main():
     app.add_handler(CallbackQueryHandler(search_page_callback, pattern="^page_")) 
     
     app.add_handler(CommandHandler("stats", show_stats_command))
+    app.add_handler(CommandHandler("errors", show_errors_command))
+    app.add_handler(MessageHandler(filters.Regex(r"^(اخطاء|أخطاء)$"), show_errors_command))
     app.add_handler(MessageHandler(filters.Regex(r"^(احصائيات|إحصائيات)$"), show_stats_command))
     app.add_handler(CallbackQueryHandler(show_stats_command, pattern="^refresh_stats$"))
 
@@ -1518,6 +1598,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
