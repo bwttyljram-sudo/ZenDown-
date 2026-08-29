@@ -365,7 +365,7 @@ def _blocking_extract_info(url):
         'cookiefile': COOKIES_FILE,
         'proxy': PROXY_URL,
         'extractor_args': {
-            'youtube': {'player_client': ['android', 'ios', 'mweb', 'web']},
+            'youtube': {'player_client': ['tv', 'android', 'ios', 'mweb', 'web']},
             'twitter': {'api': ['syndication']},
             'tiktok': {'api_hostname': ['api22-normal-c-useast2a.tiktokv.com']}
         },
@@ -662,7 +662,7 @@ async def download_action_callback(update: Update, context: ContextTypes.DEFAULT
             'nocheckcertificate': True,
             'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
             'extractor_args': {
-                'youtube': {'player_client': ['android', 'ios', 'web']},
+                'youtube': {'player_client': ['tv', 'android', 'ios', 'web']},
                 'twitter': {'api': ['syndication']},
                 'tiktok': {'api_hostname': ['api22-normal-c-useast2a.tiktokv.com']}
             }
@@ -1165,7 +1165,7 @@ def _blocking_extract_info(url):
         'cookiefile': COOKIES_FILE,
         'proxy': PROXY_URL,
         'extractor_args': {
-            'youtube': {'player_client': ['android', 'ios', 'mweb', 'web']},
+            'youtube': {'player_client': ['tv', 'android', 'ios', 'mweb', 'web']},
             'twitter': {'api': ['syndication']},
             'tiktok': {'api_hostname': ['api22-normal-c-useast2a.tiktokv.com']}
         },
@@ -1462,7 +1462,7 @@ async def download_action_callback(update: Update, context: ContextTypes.DEFAULT
             'nocheckcertificate': True,
             'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
             'extractor_args': {
-                'youtube': {'player_client': ['android', 'ios', 'web']},
+                'youtube': {'player_client': ['tv', 'android', 'ios', 'web']},
                 'twitter': {'api': ['syndication']},
                 'tiktok': {'api_hostname': ['api22-normal-c-useast2a.tiktokv.com']}
             }
@@ -1598,6 +1598,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
