@@ -11,9 +11,9 @@ import urllib.error
 import time
 from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, LabeledPrice
 from telegram.ext import (
-    ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, CallbackQueryHandler, filters
+    ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, CallbackQueryHandler, PreCheckoutQueryHandler, filters
 )
 
 # تحديث تلقائي لمكتبة yt-dlp
@@ -306,6 +306,7 @@ async def show_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     sent_vids = stats.get("sent_videos", 0)
     req_limits = stats.get("request_limits", 0)
     share_clicks = stats.get("share_clicks", 0)
+    star_donations = stats.get("star_donations", 0)
 
     total_dl = success_dl + failed_dl
     rate = (success_dl / total_dl * 100) if total_dl > 0 else 0.0
@@ -369,6 +370,7 @@ async def show_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"🔗 ضغطات المشاركة : {share_clicks}\n"
         f"💾 Cache Hit Rate : 0.0%\n"
         f"✅ معدل النجاح     : {rate:.1f}%\n"
+        f"🌟 تبرعات بالنجوم  : {star_donations}\n"
         "───────────────\n\n"
         f"⏰ <b>وقت التشغيل:</b> {days} يوم {hours} ساعة {minutes} دقيقة\n"
         "🔄 <b>تحديث الإحصائيات:</b> كل 100 حدث أو عند الإيقاف"
@@ -694,6 +696,32 @@ async def process_link_info(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         await update.message.reply_text(caption, parse_mode="HTML", reply_markup=markup)
 
 # ================== التحميل الذكي المحسّن والجدار الأمني ==================
+# ================== زر التبرع بنجمة (Telegram Stars) ==================
+async def donate_star_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    try:
+        await context.bot.send_invoice(
+            chat_id=q.message.chat_id,
+            title="دعم بوت ZenDown",
+            description="تبرع بنجمة واحدة لدعم استمرار وتطوير البوت 💙",
+            payload="zendown_star_donation",
+            currency="XTR",
+            prices=[LabeledPrice("نجمة دعم", 1)],
+        )
+    except Exception as e:
+        logger.error(f"Failed to send star invoice: {e}")
+        await q.message.reply_text("❌ تعذر فتح نافذة التبرع حالياً، حاول لاحقاً.")
+
+async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.pre_checkout_query
+    await query.answer(ok=True)
+
+async def successful_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    stats["star_donations"] = stats.get("star_donations", 0) + 1
+    save_stats()
+    await update.message.reply_text("🌟 شكراً جزيلاً على دعمك! هذا يساعدنا نستمر ونطوّر البوت. 💙")
+
 async def download_action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -818,6 +846,9 @@ async def download_action_callback(update: Update, context: ContextTypes.DEFAULT
                 elif action == "aud": await q.message.reply_audio(audio=f, caption="🎵 تم بواسطة @ZenDown_Bot")
                 elif action == "voc": await q.message.reply_voice(voice=f, caption="🎙 تم بواسطة @ZenDown_Bot")
 
+            donate_markup = InlineKeyboardMarkup([[InlineKeyboardButton("تبرع للبوت بـ 1 ⭐", callback_data="donate_star")]])
+            await q.message.reply_text("لو حاب تدعم استمرار البوت، تقدر تتبرع بنجمة ⬇️", reply_markup=donate_markup)
+
             track_download_status(True, platform)
             await status_msg.delete()
         else:
@@ -849,6 +880,9 @@ def main():
     app.add_handler(CallbackQueryHandler(show_stats_command, pattern="^refresh_stats$"))
 
     app.add_handler(CallbackQueryHandler(download_action_callback, pattern="^down_"))
+    app.add_handler(CallbackQueryHandler(donate_star_callback, pattern="^donate_star$"))
+    app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
     app.add_handler(MessageHandler(filters.Regex(r"^/dl_"), handle_message))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
 
@@ -857,6 +891,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
