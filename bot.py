@@ -668,6 +668,54 @@ async def search_page_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     await q.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
 
 # ================== جلب معلومات الرابط ==================
+def _blocking_download_image_bytes(image_url, opener=None):
+    """ينزل صورة من رابط مباشر معروف مسبقاً (بدون التحقق من كونه صورة، لأننا متأكدين منه)."""
+    opener = opener or _get_urllib_opener()
+    req = urllib.request.Request(image_url, headers={
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+    })
+    with opener.open(req, timeout=20) as resp:
+        content_type = resp.headers.get('Content-Type', '').lower()
+        ext = content_type.split('/')[-1].split(';')[0].strip() if content_type.startswith('image/') else ''
+        if ext not in ('jpeg', 'jpg', 'png', 'webp', 'gif', 'bmp'):
+            path_ext = image_url.split('?')[0].rsplit('.', 1)[-1].lower()
+            ext = path_ext if path_ext in ('jpeg', 'jpg', 'png', 'webp', 'gif', 'bmp') else 'jpg'
+        data = resp.read()
+        if len(data) < 500:
+            raise Exception("الملف الناتج صغير جداً ليكون صورة حقيقية")
+        out_path = f"zendown_img_{uuid.uuid4().hex[:8]}.{ext}"
+        with open(out_path, 'wb') as f:
+            f.write(data)
+    return out_path
+
+def _blocking_extract_og_image(page_url):
+    """
+    يقرأ HTML الصفحة نفسها ويستخرج رابط الصورة الرئيسية منها (وسم og:image أو twitter:image).
+    هذا يشتغل مع أي موقع تقريباً (بينترست، تويتر، فيسبوك...) لأنه معيار عام مستخدم بكل الويب.
+    """
+    import re
+    opener = _get_urllib_opener()
+    req = urllib.request.Request(page_url, headers={
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+    })
+    with opener.open(req, timeout=15) as resp:
+        html = resp.read(500_000).decode('utf-8', errors='ignore')  # أول 500KB كافية غالباً للـ head
+
+    patterns = [
+        r'<meta[^>]+property=["\']og:image(?::secure_url)?["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image(?::secure_url)?["\']',
+        r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']twitter:image["\']',
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, html, re.IGNORECASE)
+        if m:
+            img_url = m.group(1).replace('&amp;', '&')
+            if img_url.startswith('//'):
+                img_url = 'https:' + img_url
+            return img_url
+    raise Exception("لم يتم العثور على صورة رئيسية بالصفحة (og:image)")
+
 def _blocking_try_download_image(url):
     """
     يحاول يتأكد إن الرابط صورة مباشرة (بفحص Content-Type) وينزلها.
@@ -708,43 +756,81 @@ def _blocking_detect_content_type(url):
         except Exception:
             return ''
 
+def _is_real_video_info(info):
+    """يفرق بين نتيجة فيديو حقيقية ونتيجة صورة (بعض المستخرجات مثل بينترست ترجع معلومات ناجحة لصور بدون أي مسار فيديو فعلي)."""
+    formats = info.get('formats') or []
+    if formats:
+        for f in formats:
+            if (f.get('vcodec') not in (None, 'none')) or (f.get('acodec') not in (None, 'none')):
+                return True
+        return False
+    ext = (info.get('ext') or '').lower()
+    if ext in ('jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp'):
+        return False
+    vcodec = info.get('vcodec')
+    acodec = info.get('acodec')
+    if vcodec in (None, 'none') and acodec in (None, 'none'):
+        return False
+    return True
+
+async def _try_send_as_image(update, url, direct_image_url=None):
+    """يحاول يجيب صورة (من رابط مباشر معروف أو بالبحث عن og:image بالصفحة) ويرسلها. يرجع True لو نجح."""
+    img_path = None
+    try:
+        if direct_image_url:
+            img_path = await asyncio.to_thread(_blocking_download_image_bytes, direct_image_url)
+        else:
+            og_url = await asyncio.to_thread(_blocking_extract_og_image, url)
+            img_path = await asyncio.to_thread(_blocking_download_image_bytes, og_url)
+    except Exception:
+        return False
+
+    if not img_path:
+        return False
+    try:
+        platform = detect_platform(url)
+        with open(img_path, 'rb') as f:
+            await update.message.reply_photo(photo=f, caption="🖼 تم بواسطة @ZenDown_Bot")
+        track_download_status(True, platform)
+        return True
+    except Exception as e:
+        logger.error(f"Failed to send resolved image: {e}")
+        return False
+    finally:
+        if os.path.exists(img_path):
+            try: os.remove(img_path)
+            except Exception: pass
+
 async def process_link_info(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str):
     msg = await update.message.reply_text("⚡️ جاري تحليل الرابط...")
 
-    # الفحص الأول قبل أي شي: هل الرابط صورة مباشرة؟ (يمنع مرور الصور عبر مسار الفيديو بالكامل)
+    # الفحص الأول: هل الرابط صورة مباشرة (ملف صورة حقيقي، مو صفحة ويب)؟
     try:
         content_type = await asyncio.to_thread(_blocking_detect_content_type, url)
     except Exception:
         content_type = ''
 
     if content_type.startswith('image/'):
-        try:
-            img_path = await asyncio.to_thread(_blocking_try_download_image, url)
-            platform = detect_platform(url)
-            try:
-                with open(img_path, 'rb') as f:
-                    await update.message.reply_photo(photo=f, caption="🖼 تم بواسطة @ZenDown_Bot")
-                track_download_status(True, platform)
-            finally:
-                if os.path.exists(img_path):
-                    try: os.remove(img_path)
-                    except Exception: pass
+        if await _try_send_as_image(update, url, direct_image_url=url):
             await msg.delete()
             return
-        except Exception as e:
-            logger.error(f"Image download failed despite image Content-Type: {e}")
-            # كمل بالسلوك العادي لو فشل التحميل الفعلي رغم إنه صورة
 
     title = None
     uploader = 'غير معروف'
     thumbnail = None
     video_info_failed = False
+    image_only_result = False
+    info_result = None
 
     try:
         info = await asyncio.to_thread(_blocking_extract_info, url)
-        title = info.get('title')
-        uploader = info.get('uploader', 'غير معروف')
-        thumbnail = info.get('thumbnail')
+        info_result = info
+        if not _is_real_video_info(info):
+            image_only_result = True
+        else:
+            title = info.get('title')
+            uploader = info.get('uploader', 'غير معروف')
+            thumbnail = info.get('thumbnail')
     except Exception as e:
         video_info_failed = True
         try:
@@ -758,23 +844,21 @@ async def process_link_info(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         except Exception:
             pass
 
-    # فحص ثانوي احتياطي - لو فشل استخراج الفيديو، نتأكد مرة أخيرة إنه مو صورة (حالات نادرة فاتت الفحص الأول)
-    if video_info_failed:
-        try:
-            img_path = await asyncio.to_thread(_blocking_try_download_image, url)
-            platform = detect_platform(url)
-            try:
-                with open(img_path, 'rb') as f:
-                    await update.message.reply_photo(photo=f, caption="🖼 تم بواسطة @ZenDown_Bot")
-                track_download_status(True, platform)
-            finally:
-                if os.path.exists(img_path):
-                    try: os.remove(img_path)
-                    except Exception: pass
+    # الحالة 1: يوتيوب-دي-إل نفسه رجّع نتيجة "صورة" (زي بينات بينترست) - نستخدم الرابط المباشر من نتيجته
+    if image_only_result and info_result:
+        direct_url = info_result.get('url') or info_result.get('thumbnail')
+        if direct_url and await _try_send_as_image(update, url, direct_image_url=direct_url):
             await msg.delete()
             return
-        except Exception:
-            pass
+
+    # الحالة 2: فشل استخراج فيديو تماماً - نجرب نفس الرابط كصورة مباشرة، وبعدها نجرب قراءة og:image من الصفحة
+    if video_info_failed:
+        if await _try_send_as_image(update, url, direct_image_url=url):
+            await msg.delete()
+            return
+        if await _try_send_as_image(update, url):  # يستخدم og:image scraping
+            await msg.delete()
+            return
 
     if not title:
         title = "مقطع وسائط (جاهز للتحميل)"
@@ -921,6 +1005,12 @@ async def download_action_callback(update: Update, context: ContextTypes.DEFAULT
                 except Exception as e:
                     root_cause = f" | السبب الحقيقي: {e.__cause__}" if e.__cause__ else ""
                     logger.error(f"Attempt {attempt + 1} failed: {e}{root_cause}")
+                    err_text = str(e).lower()
+                    if action == "vid" and ("no video formats" in err_text or "requested format is not available" in err_text):
+                        # غالباً الرابط صورة مش فيديو - نجرب نرسلها كصورة بدل ما نفشل بالكامل
+                        if await _try_send_as_image(update, url):
+                            await status_msg.delete()
+                            return
                     if attempt < max_retries - 1:
                         await status_msg.edit_text(f"⚠️ جاري المحاولة مرة أخرى ({attempt + 2}/{max_retries})...")
                         await asyncio.sleep(2)
@@ -1001,6 +1091,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
