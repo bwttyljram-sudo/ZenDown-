@@ -90,15 +90,22 @@ logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s
 logger = logging.getLogger("ZenDown_Bot")
 
 # ذاكرة تخزن آخر الأخطاء - عشان الأدمن يشوفها من داخل تيليجرام بدون الدخول لـ Render
+# فيه قائمتين: وحدة لكل الأخطاء، ووحدة "منقّاة" بدون ضجيج تيك توك/يوتيوب المتكرر
+# عشان أخطاء إنستقرام/سناب شات/فيسبوك/بينترست ما تنطمر وتضيع بسرعة
 from collections import deque
-RECENT_ERRORS = deque(maxlen=15)
+RECENT_ERRORS = deque(maxlen=40)
+RECENT_ERRORS_OTHER = deque(maxlen=40)
+_NOISY_PLATFORMS_KEYWORDS = ("tiktok", "youtube", "tikwm")
 
 class _ErrorCaptureHandler(logging.Handler):
     def emit(self, record):
         if record.levelno >= logging.ERROR:
             try:
                 msg = self.format(record)
-                RECENT_ERRORS.append(f"{datetime.now().strftime('%H:%M:%S')} - {msg[:500]}")
+                entry = f"{datetime.now().strftime('%H:%M:%S')} - {msg[:500]}"
+                RECENT_ERRORS.append(entry)
+                if not any(kw in msg.lower() for kw in _NOISY_PLATFORMS_KEYWORDS):
+                    RECENT_ERRORS_OTHER.append(entry)
             except Exception:
                 pass
 
@@ -274,24 +281,33 @@ async def check_user_subscription(bot, user_id: int) -> bool:
         return False
 
 # ================== عرض آخر الأخطاء (للأدمن فقط) ==================
-async def show_errors_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not user or user.id != ADMIN_ID:
-        return
-
-    if not RECENT_ERRORS:
-        await update.message.reply_text("✅ ما فيه أي أخطاء مسجلة منذ آخر تشغيل للبوت.")
-        return
-
-    text = "🛑 <b>آخر الأخطاء المسجلة</b>\n━━━━━━━\n\n"
-    for i, err in enumerate(reversed(RECENT_ERRORS), 1):
+def _format_errors_list(title, errors_deque):
+    if not errors_deque:
+        return f"✅ {title}\n\nما فيه أي أخطاء مسجلة منذ آخر تشغيل للبوت."
+    text = f"🛑 <b>{title}</b>\n━━━━━━━\n\n"
+    for i, err in enumerate(reversed(errors_deque), 1):
         # هروب من رموز HTML عشان ما يكسر تنسيق الرسالة
         safe_err = err.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
         text += f"{i}. <code>{safe_err}</code>\n\n"
         if len(text) > 3500:  # حد أقصى تقريبي لرسالة تيليجرام
             text += "... (يوجد المزيد، هذا آخر جزء ظاهر)"
             break
+    return text
 
+async def show_errors_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """يعرض أخطاء المنصات الأخرى فقط (بدون تيك توك ويوتيوب) عشان ما تنطمر بضجيج تيك توك المتكرر."""
+    user = update.effective_user
+    if not user or user.id != ADMIN_ID:
+        return
+    text = _format_errors_list("آخر أخطاء المنصات الأخرى (بدون تيك توك/يوتيوب)", RECENT_ERRORS_OTHER)
+    await update.message.reply_text(text, parse_mode="HTML")
+
+async def show_all_errors_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """يعرض كل الأخطاء المسجلة شامل تيك توك ويوتيوب."""
+    user = update.effective_user
+    if not user or user.id != ADMIN_ID:
+        return
+    text = _format_errors_list("كل الأخطاء المسجلة (شامل تيك توك ويوتيوب)", RECENT_ERRORS)
     await update.message.reply_text(text, parse_mode="HTML")
 
 # ================== لوحة الإحصائيات ==================
@@ -757,24 +773,41 @@ def _blocking_detect_content_type(url):
             return ''
 
 def _is_real_video_info(info):
-    """يفرق بين نتيجة فيديو حقيقية ونتيجة صورة (بعض المستخرجات مثل بينترست ترجع معلومات ناجحة لصور بدون أي مسار فيديو فعلي)."""
+    """
+    يفرق بين نتيجة فيديو/صوت حقيقية ونتيجة صورة (بعض المستخرجات مثل بينترست أو سناب شات ترجع
+    معلومات ناجحة لصور أو بدون تفاصيل كودك كاملة).
+    المعيار الأدق: وجود 'duration' (مدة تشغيل) - أي فيديو أو صوت حقيقي دايماً له مدة، بينما
+    الصور (بينات بينترست مثلاً) ما عندها مدة إطلاقاً. هذا أوثق بكثير من فحص أسماء الكودك
+    لأن بعض المستخرجات (سناب شات مثلاً) ترجع معلومات فيديو حقيقية بدون تفاصيل كودك كاملة،
+    وكان هذا يسبب تصنيفها غلط كـ"صورة" ويرسلها البوت بصيغة صورة بالخطأ.
+    """
+    if info.get('duration'):
+        return True
+
     formats = info.get('formats') or []
+    for f in formats:
+        if (f.get('vcodec') not in (None, 'none')) or (f.get('acodec') not in (None, 'none')):
+            return True
     if formats:
-        for f in formats:
-            if (f.get('vcodec') not in (None, 'none')) or (f.get('acodec') not in (None, 'none')):
-                return True
+        # فيه formats لكن كلها بدون كودك فيديو/صوت - غالباً صورة فعلاً
         return False
+
     ext = (info.get('ext') or '').lower()
     if ext in ('jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp'):
         return False
-    vcodec = info.get('vcodec')
-    acodec = info.get('acodec')
-    if vcodec in (None, 'none') and acodec in (None, 'none'):
-        return False
+
+    # ما فيه أي إشارة واضحة - نفترض إنه فيديو/صوت (الافتراض الآمن) عشان ما نكسر منصات شغالة
     return True
 
-async def _try_send_as_image(update, url, direct_image_url=None):
-    """يحاول يجيب صورة (من رابط مباشر معروف أو بالبحث عن og:image بالصفحة) ويرسلها. يرجع True لو نجح."""
+async def _try_send_as_image(message, url, direct_image_url=None):
+    """
+    يحاول يجيب صورة (من رابط مباشر معروف أو بالبحث عن og:image بالصفحة) ويرسلها. يرجع True لو نجح.
+    ملاحظة مهمة: 'message' يجب يكون كائن الرسالة الصحيح للرد عليه:
+      - update.message في سياق رسالة نصية عادية (process_link_info)
+      - q.message في سياق ضغط زر (download_action_callback)
+    وليس كائن update نفسه أبداً، لأن update.message يكون None داخل الكولباك، وهذا كان يسبب
+    كراش صامت (AttributeError) في بعض حالات الفشل السابقة.
+    """
     img_path = None
     try:
         if direct_image_url:
@@ -790,14 +823,14 @@ async def _try_send_as_image(update, url, direct_image_url=None):
     try:
         platform = detect_platform(url)
         with open(img_path, 'rb') as f:
-            await update.message.reply_photo(photo=f, caption="🖼 تم بواسطة @ZenDown_Bot")
+            await message.reply_photo(photo=f, caption="🖼 تم بواسطة @ZenDown_Bot")
         track_download_status(True, platform)
         return True
     except Exception as e:
         logger.error(f"Failed to send resolved image: {e}")
         return False
     finally:
-        if os.path.exists(img_path):
+        if img_path and os.path.exists(img_path):
             try: os.remove(img_path)
             except Exception: pass
 
@@ -811,7 +844,7 @@ async def process_link_info(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         content_type = ''
 
     if content_type.startswith('image/'):
-        if await _try_send_as_image(update, url, direct_image_url=url):
+        if await _try_send_as_image(update.message, url, direct_image_url=url):
             await msg.delete()
             return
 
@@ -847,16 +880,16 @@ async def process_link_info(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     # الحالة 1: يوتيوب-دي-إل نفسه رجّع نتيجة "صورة" (زي بينات بينترست) - نستخدم الرابط المباشر من نتيجته
     if image_only_result and info_result:
         direct_url = info_result.get('url') or info_result.get('thumbnail')
-        if direct_url and await _try_send_as_image(update, url, direct_image_url=direct_url):
+        if direct_url and await _try_send_as_image(update.message, url, direct_image_url=direct_url):
             await msg.delete()
             return
 
     # الحالة 2: فشل استخراج فيديو تماماً - نجرب نفس الرابط كصورة مباشرة، وبعدها نجرب قراءة og:image من الصفحة
     if video_info_failed:
-        if await _try_send_as_image(update, url, direct_image_url=url):
+        if await _try_send_as_image(update.message, url, direct_image_url=url):
             await msg.delete()
             return
-        if await _try_send_as_image(update, url):  # يستخدم og:image scraping
+        if await _try_send_as_image(update.message, url):  # يستخدم og:image scraping
             await msg.delete()
             return
 
@@ -1008,7 +1041,7 @@ async def download_action_callback(update: Update, context: ContextTypes.DEFAULT
                     err_text = str(e).lower()
                     if action == "vid" and ("no video formats" in err_text or "requested format is not available" in err_text):
                         # غالباً الرابط صورة مش فيديو - نجرب نرسلها كصورة بدل ما نفشل بالكامل
-                        if await _try_send_as_image(update, url):
+                        if await _try_send_as_image(q.message, url):
                             await status_msg.delete()
                             return
                     if attempt < max_retries - 1:
@@ -1025,8 +1058,15 @@ async def download_action_callback(update: Update, context: ContextTypes.DEFAULT
             if needs_compress:
                 await status_msg.edit_text("🗜 حجم المقطع كبير.. جاري الضغط السريع (طلبات المستخدمين الآخرين تستمر بدون توقف)...")
                 async with COMPRESS_SEMAPHORE:
+                    original_path = file_path
                     comp_path = file_path.rsplit('.', 1)[0] + '_c.mp4'
                     file_path = await asyncio.to_thread(_compress_video_sync, file_path, comp_path)
+                    # إصلاح تسرّب ذاكرة/قرص حقيقي: لو الضغط نجح ورجع مسار مختلف عن الأصلي،
+                    # كان الملف الأصلي غير المضغوط يضل على القرص للأبد ويتراكم مع كل تحميل كبير.
+                    # نحذفه فوراً بعد التأكد إن عندنا النسخة المضغوطة بدلاً منه.
+                    if file_path != original_path and os.path.exists(original_path):
+                        try: os.remove(original_path)
+                        except Exception: pass
 
             # جدار حماية تيليجرام
             final_size_mb = os.path.getsize(file_path) / (1024 * 1024)
@@ -1075,7 +1115,9 @@ def main():
     
     app.add_handler(CommandHandler("stats", show_stats_command))
     app.add_handler(CommandHandler("errors", show_errors_command))
+    app.add_handler(CommandHandler("all_errors", show_all_errors_command))
     app.add_handler(MessageHandler(filters.Regex(r"^(اخطاء|أخطاء)$"), show_errors_command))
+    app.add_handler(MessageHandler(filters.Regex(r"^(كل الأخطاء|جميع الأخطاء)$"), show_all_errors_command))
     app.add_handler(MessageHandler(filters.Regex(r"^(احصائيات|إحصائيات)$"), show_stats_command))
     app.add_handler(CallbackQueryHandler(show_stats_command, pattern="^refresh_stats$"))
 
