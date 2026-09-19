@@ -153,6 +153,12 @@ SEARCH_SEMAPHORE = asyncio.Semaphore(2)
 # التراكمي مع الوقت تحت الحمل الحقيقي (300+ مستخدم).
 INFO_SEMAPHORE = asyncio.Semaphore(3)
 
+# سيمافور مخصص لرفع الملفات الكبيرة لخدمة استضافة خارجية (بديل الملفات فوق 50 ميجا).
+# هالعملية تحمّل الملف كامل بالذاكرة (RAM) مرتين تقريباً وقت الرفع - لو صار أكثر من رفعة
+# كبيرة بنفس اللحظة، الذاكرة تقفز فجأة بشكل حاد بدل تسرب تدريجي، وده كان على الأرجح سبب
+# التوقف المفاجئ (بدل إعادة التشغيل التدريجية المعتادة). بتحديد رفعة وحدة بالوقت، نمنع القفزة.
+UPLOAD_SEMAPHORE = asyncio.Semaphore(1)
+
 # منفذ ثريدات محدود صراحة بدل الاعتماد على asyncio.to_thread (اللي يستخدم منفذ افتراضي
 # غير محدود عملياً تحت الحمل). كل عملية حاجزة بالبوت (تحميل/ضغط/بحث/تحليل رابط) تمر من هنا،
 # فمهما زاد عدد المستخدمين بنفس اللحظة، عدد الثريدات الفعلي المفتوح ما يتعدى هالسقف أبداً -
@@ -930,7 +936,8 @@ async def download_action_callback(update: Update, context: ContextTypes.DEFAULT
             if final_size_mb >= 49.5:
                 await status_msg.edit_text("📦 المقطع أكبر من حد تليجرام (50 ميجا)، جاري رفعه لرابط تحميل مباشر...")
                 try:
-                    external_url = await run_blocking(_blocking_upload_to_external_host, file_path)
+                    async with UPLOAD_SEMAPHORE:
+                        external_url = await run_blocking(_blocking_upload_to_external_host, file_path)
                     await q.message.reply_text(
                         f"✅ المقطع كبير الحجم ({final_size_mb:.1f} ميجا)، تجاوز حد تليجرام للبوتات.\n"
                         f"حمّله من هذا الرابط المباشر:\n{external_url}"
@@ -1013,4 +1020,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
