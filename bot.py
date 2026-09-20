@@ -140,7 +140,7 @@ else:
     print("ℹ️ لا يوجد بروكسي مُعرّف حالياً (اختياري).")
 
 # أقصى عدد تحميلات متزامنة لحماية الموارد (تحميل فقط - لا يشمل الضغط)
-MAX_CONCURRENT_DOWNLOADS = 2
+MAX_CONCURRENT_DOWNLOADS = 1
 DOWNLOAD_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 
 # سيمافور مستقل للبحث - يمنع انفجار الذاكرة لو كثير مستخدمين بحثوا بنفس اللحظة
@@ -151,7 +151,7 @@ SEARCH_SEMAPHORE = asyncio.Semaphore(2)
 # قبل هذا التعديل، أي عدد من المستخدمين ممكن يشغلوا عدد غير محدود من الثريدات بنفس اللحظة
 # لتحليل روابطهم، وكل ثريد ياخذ ذاكرة (stack) وما يترحرر بسرعة - وهذا مرشح قوي لتسرب الذاكرة
 # التراكمي مع الوقت تحت الحمل الحقيقي (300+ مستخدم).
-INFO_SEMAPHORE = asyncio.Semaphore(3)
+INFO_SEMAPHORE = asyncio.Semaphore(2)
 
 # سيمافور مخصص لرفع الملفات الكبيرة لخدمة استضافة خارجية (بديل الملفات فوق 50 ميجا).
 # هالعملية تحمّل الملف كامل بالذاكرة (RAM) مرتين تقريباً وقت الرفع - لو صار أكثر من رفعة
@@ -164,7 +164,7 @@ UPLOAD_SEMAPHORE = asyncio.Semaphore(1)
 # فمهما زاد عدد المستخدمين بنفس اللحظة، عدد الثريدات الفعلي المفتوح ما يتعدى هالسقف أبداً -
 # وهذا يمنع تراكم ذاكرة الـ stack بتاع الثريدات اللي كان على الأرجح السبب الرئيسي للتسرب.
 import concurrent.futures
-BLOCKING_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=10, thread_name_prefix="zendown-worker")
+BLOCKING_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=6, thread_name_prefix="zendown-worker")
 
 async def run_blocking(func, *args):
     """يشغّل دالة حاجزة على المنفذ المحدود بدل asyncio.to_thread."""
@@ -990,8 +990,36 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
     logger.error(f"استثناء غير متوقع (Unhandled): {context.error}\n{tb_string[-1500:]}")
 
 # ================== التشغيل الرئيسي ==================
+# ================== حارس الذاكرة (Memory Watchdog) ==================
+async def _memory_watchdog():
+    """
+    يراقب استهلاك الذاكرة الفعلي للعملية كل 5 دقائق. لو اقترب من حد الخطر، يعيد تشغيل
+    العملية بشكل منظم ونظيف (خلال ثوانٍ، وRender يعيد تشغيلها تلقائياً فوراً) بدل ما ينتظر
+    حتى تمتلئ الذاكرة بالكامل ويضطر Render يقتل العملية بالقوة (اللي يسبب التجمد الكامل).
+    هذا ما يحل سبب استهلاك الذاكرة نفسه، بس يحول أي مشكلة مستقبلية لانقطاع خاطف ومتحكم فيه
+    بدل توقف كامل يحتاج تدخل يدوي.
+    """
+    THRESHOLD_MB = 420  # هامش أمان تحت حد 512 ميجا (النسخة المجانية بريندر)
+    while True:
+        await asyncio.sleep(300)  # فحص كل 5 دقائق
+        try:
+            with open('/proc/self/status') as f:
+                for line in f:
+                    if line.startswith('VmRSS:'):
+                        rss_mb = int(line.split()[1]) / 1024
+                        logger.info(f"Memory watchdog: RSS={rss_mb:.0f}MB")
+                        if rss_mb >= THRESHOLD_MB:
+                            logger.error(f"Memory watchdog: تجاوزت الذاكرة {rss_mb:.0f}MB الحد الآمن ({THRESHOLD_MB}MB) - إعادة تشغيل منظمة الآن.")
+                            os._exit(0)
+                        break
+        except Exception as e:
+            logger.error(f"Memory watchdog check failed: {e}")
+
+async def _post_init(application):
+    asyncio.create_task(_memory_watchdog())
+
 def main():
-    app = ApplicationBuilder().token(TOKEN).concurrent_updates(True).build()
+    app = ApplicationBuilder().token(TOKEN).concurrent_updates(True).post_init(_post_init).build()
     app.add_error_handler(global_error_handler)
 
     app.add_handler(CommandHandler("start", start))
@@ -1020,5 +1048,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
