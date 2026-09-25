@@ -143,6 +143,14 @@ else:
 MAX_CONCURRENT_DOWNLOADS = 1
 DOWNLOAD_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 
+# عداد الطلبات المنتظرة بالطابور - بدون سقف، أي عدد طلبات ممكن ينتظر بلا حد، وكل طلب منتظر
+# ياخذ ذاكرة وهو واقف بالدور. وقت الزحمة الكبيرة (آلاف المستخدمين)، الطابور يكبر بلا توقف
+# ويصير هو نفسه سبب انفجار الذاكرة (حلقة مفرغة). بحد أقصى للطابور، أي طلب زايد يترفض فوراً
+# برسالة واضحة بدل ما يتراكم للأبد.
+MAX_QUEUE_SIZE = 6
+_pending_downloads = 0
+_pending_lock = asyncio.Lock()
+
 # سيمافور مستقل للبحث - يمنع انفجار الذاكرة لو كثير مستخدمين بحثوا بنفس اللحظة
 SEARCH_SEMAPHORE = asyncio.Semaphore(2)
 
@@ -835,6 +843,18 @@ async def download_action_callback(update: Update, context: ContextTypes.DEFAULT
         await q.message.reply_text("❌ انتهت صلاحية هذه الجلسة، أعد إرسال الرابط.")
         return
 
+    # فحص الزحمة: لو عدد الطلبات المنتظرة وصل للحد الأقصى، نرفض فوراً برسالة واضحة
+    # بدل ما نضيف الطلب لطابور بلا سقف يتراكم ويصير هو نفسه سبب انفجار الذاكرة.
+    global _pending_downloads
+    async with _pending_lock:
+        if _pending_downloads >= MAX_QUEUE_SIZE:
+            await q.message.reply_text(
+                "🚧 البوت مزدحم جداً حالياً (عدد كبير من الطلبات بالطابور).\n"
+                "حاول مرة ثانية بعد كم دقيقة 🙏"
+            )
+            return
+        _pending_downloads += 1
+
     platform = detect_platform(url)
     status_msg = await q.message.reply_text("⏳ أضيفت إلى طابور التحميل الذكي...")
     out_tmpl = f"zendown_{sid}.%(ext)s"
@@ -849,6 +869,7 @@ async def download_action_callback(update: Update, context: ContextTypes.DEFAULT
         'proxy': PROXY_URL,
             'geo_bypass': True,
             'nocheckcertificate': True,
+            'socket_timeout': 20,
             'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
             'extractor_args': {
                 'youtube': {'player_client': ['tv', 'android', 'ios', 'web']},
@@ -867,6 +888,7 @@ async def download_action_callback(update: Update, context: ContextTypes.DEFAULT
         'proxy': PROXY_URL,
             'geo_bypass': True,
             'nocheckcertificate': True,
+            'socket_timeout': 20,
             'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
         }
     else:
@@ -880,6 +902,7 @@ async def download_action_callback(update: Update, context: ContextTypes.DEFAULT
         'proxy': PROXY_URL,
             'geo_bypass': True,
             'nocheckcertificate': True,
+            'socket_timeout': 20,
             'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
         }
 
@@ -897,11 +920,15 @@ async def download_action_callback(update: Update, context: ContextTypes.DEFAULT
         if is_tiktok and action in ("vid", "aud"):
             try:
                 tikwm_out = f"zendown_{sid}_tikwm.{'mp3' if action == 'aud' else 'mp4'}"
-                file_path = await run_blocking(
-                    _blocking_tiktok_via_tikwm, url, tikwm_out, action == "aud"
+                file_path = await asyncio.wait_for(
+                    run_blocking(_blocking_tiktok_via_tikwm, url, tikwm_out, action == "aud"),
+                    timeout=60
                 )
                 if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
                     success_download = True
+            except asyncio.TimeoutError:
+                logger.error("TikWM fallback timed out after 60s")
+                file_path = None
             except Exception as e:
                 logger.error(f"TikWM fallback failed: {e}")
                 file_path = None
@@ -909,13 +936,18 @@ async def download_action_callback(update: Update, context: ContextTypes.DEFAULT
         if not success_download:
             for attempt in range(max_retries):
                 try:
-                    file_path = await run_blocking(_blocking_download, url, opts)
+                    file_path = await asyncio.wait_for(run_blocking(_blocking_download, url, opts), timeout=90)
                     if action == "aud": file_path = file_path.rsplit('.', 1)[0] + '.mp3'
                     if action == "voc": file_path = file_path.rsplit('.', 1)[0] + '.ogg'
 
                     if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
                         success_download = True
                         break
+                except asyncio.TimeoutError:
+                    logger.error(f"Attempt {attempt + 1} timed out after 90s (تعليق بدون مهلة كان يقفل الطابور بالكامل)")
+                    if attempt < max_retries - 1:
+                        await status_msg.edit_text(f"⚠️ جاري المحاولة مرة أخرى ({attempt + 2}/{max_retries})...")
+                        await asyncio.sleep(2)
                 except Exception as e:
                     root_cause = f" | السبب الحقيقي: {e.__cause__}" if e.__cause__ else ""
                     logger.error(f"Attempt {attempt + 1} failed: {e}{root_cause}")
@@ -977,6 +1009,8 @@ async def download_action_callback(update: Update, context: ContextTypes.DEFAULT
         if file_path and os.path.exists(file_path):
             try: os.remove(file_path)
             except Exception: pass
+        async with _pending_lock:
+            _pending_downloads -= 1
 
 # ================== معالج الأخطاء العام ==================
 async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -1050,6 +1084,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
