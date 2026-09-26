@@ -128,20 +128,17 @@ _pending_downloads = 0
 _pending_lock = asyncio.Lock()
 
 # سيمافور مستقل للبحث - يمنع انفجار الذاكرة لو كثير مستخدمين بحثوا بنفس اللحظة
-SEARCH_SEMAPHORE = asyncio.Semaphore(2)
 
 
 # سيمافور لتحليل الروابط (استخراج المعلومات فقط، قبل التحميل) - كان بدون أي حد أقصى إطلاقاً
 # قبل هذا التعديل، أي عدد من المستخدمين ممكن يشغلوا عدد غير محدود من الثريدات بنفس اللحظة
 # لتحليل روابطهم، وكل ثريد ياخذ ذاكرة (stack) وما يترحرر بسرعة - وهذا مرشح قوي لتسرب الذاكرة
 # التراكمي مع الوقت تحت الحمل الحقيقي (300+ مستخدم).
-INFO_SEMAPHORE = asyncio.Semaphore(2)
 
 # سيمافور مخصص لرفع الملفات الكبيرة لخدمة استضافة خارجية (بديل الملفات فوق 50 ميجا).
 # هالعملية تحمّل الملف كامل بالذاكرة (RAM) مرتين تقريباً وقت الرفع - لو صار أكثر من رفعة
 # كبيرة بنفس اللحظة، الذاكرة تقفز فجأة بشكل حاد بدل تسرب تدريجي، وده كان على الأرجح سبب
 # التوقف المفاجئ (بدل إعادة التشغيل التدريجية المعتادة). بتحديد رفعة وحدة بالوقت، نمنع القفزة.
-UPLOAD_SEMAPHORE = asyncio.Semaphore(1)
 
 # منفذ ثريدات محدود صراحة بدل الاعتماد على asyncio.to_thread (اللي يستخدم منفذ افتراضي
 # غير محدود عملياً تحت الحمل). كل عملية حاجزة بالبوت (تحميل/ضغط/بحث/تحليل رابط) تمر من هنا،
@@ -171,7 +168,6 @@ class BoundedCache(OrderedDict):
         if len(self) > self.max_size:
             self.popitem(last=False)
 
-SEARCH_CACHE = BoundedCache(max_size=200)
 URL_CACHE = BoundedCache(max_size=500)
 
 # ================== نظام الإحصائيات ==================
@@ -460,25 +456,7 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await msg.edit_text(f"✅ تمت عملية الإذاعة بنجاح!\n\n- نجح الإرسال إلى: {success} مستخدم\n- فشل الإرسال إلى: {failed} مستخدم (قاموا بحظر البوت غالباً)")
 
-# ================== المعالجة والضغط الفائق السرعة ==================
-def _blocking_extract_info(url):
-    opts = {
-        'quiet': True, 
-        'no_warnings': True,
-        'cookiefile': COOKIES_FILE,
-        'proxy': PROXY_URL,
-        'extractor_args': {
-            'youtube': {'player_client': ['tv', 'android', 'ios', 'mweb', 'web']},
-            'twitter': {'api': ['syndication', 'graphql', 'legacy']}
-        },
-        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'geo_bypass': True, 
-        'nocheckcertificate': True,
-        'socket_timeout': 15 
-    }
-    with YoutubeDL(opts) as ydl:
-        return ydl.extract_info(url, download=False)
-
+# ================== المعالجة والتحميل ==================
 def _blocking_download(url, opts):
     with YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
@@ -490,64 +468,6 @@ def _get_urllib_opener():
         proxy_handler = urllib.request.ProxyHandler({'http': PROXY_URL, 'https': PROXY_URL})
         return urllib.request.build_opener(proxy_handler)
     return urllib.request.build_opener()
-
-def _blocking_upload_to_external_host(file_path):
-    """
-    يرفع ملف كبير (أكبر من حد تليجرام 50 ميجا) لخدمة استضافة ملفات مجانية ومجهولة (بدون تسجيل/بطاقة)
-    ويرجع رابط تحميل مباشر. يجرب أكثر من خدمة بالترتيب (سلسلة احتياطية) لأن هالخدمات المجانية
-    أحياناً تكون غير مستقرة - لو وحدة فشلت، يجرب اللي بعدها تلقائياً.
-    """
-    import mimetypes
-    filename = os.path.basename(file_path)
-    mime_type = mimetypes.guess_type(filename)[0] or 'application/octet-stream'
-    with open(file_path, 'rb') as f:
-        file_bytes = f.read()
-
-    boundary = uuid.uuid4().hex
-
-    def _multipart_body(fields, file_field_name, filename, file_bytes, mime_type):
-        parts = []
-        for name, value in fields.items():
-            parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode())
-        parts.append(
-            f'--{boundary}\r\nContent-Disposition: form-data; name="{file_field_name}"; filename="{filename}"\r\n'
-            f'Content-Type: {mime_type}\r\n\r\n'.encode() + file_bytes + b'\r\n'
-        )
-        parts.append(f'--{boundary}--\r\n'.encode())
-        return b''.join(parts)
-
-    # الخدمة الأولى: catbox.moe (تدعم حتى 200 ميجا، بدون تسجيل)
-    try:
-        body = _multipart_body({'reqtype': 'fileupload'}, 'fileToUpload', filename, file_bytes, mime_type)
-        req = urllib.request.Request(
-            "https://catbox.moe/user/api.php", data=body,
-            headers={'Content-Type': f'multipart/form-data; boundary={boundary}'}
-        )
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            result_url = resp.read().decode().strip()
-            if result_url.startswith('http'):
-                return result_url
-    except Exception as e:
-        logger.error(f"External host (catbox) failed: {e}")
-
-    # الخدمة الاحتياطية الثانية: 0x0.st (بدون تسجيل، حد أقصى أكبر)
-    try:
-        body = _multipart_body({}, 'file', filename, file_bytes, mime_type)
-        req = urllib.request.Request(
-            "https://0x0.st", data=body,
-            headers={
-                'Content-Type': f'multipart/form-data; boundary={boundary}',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-            }
-        )
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            result_url = resp.read().decode().strip()
-            if result_url.startswith('http'):
-                return result_url
-    except Exception as e:
-        logger.error(f"External host (0x0.st) failed: {e}")
-
-    raise Exception("فشلت كل خدمات الاستضافة الاحتياطية")
 
 # ================== استقبال الرسائل والبدء ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -587,12 +507,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = update.message.text.strip()
-    if text.startswith("/dl_"):
-        # روابط نتائج البحث دايماً يوتيوب - نرفض فوراً بدون أي تحليل أو استخراج معلومات
-        real_url = f"https://www.youtube.com/watch?v={text.replace('/dl_', '')}"
-        track_platform_request(real_url)
-        await update.message.reply_text("عذراً، التحميل من YouTube غير متوفر حالياً.")
-    elif text.startswith("http"):
+    if text.startswith("http"):
         platform = track_platform_request(text)
         # فحص سريع (بدون أي تحليل أو اتصال بالإنترنت) قبل أي معالجة ثقيلة، عشان ما نضيع
         # وقت ولا موارد على روابط منصات مو مدعومة بهذا البوت
@@ -603,145 +518,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await process_link_info(update, context, text)
     else:
-        await perform_youtube_search(update, context, text)
-
-# ================== البحث المباشر ==================
-def format_duration(seconds):
-    if not seconds: return "0:00"
-    m, s = divmod(int(seconds), 60)
-    h, m = divmod(m, 60)
-    if h > 0: return f"{h}:{m:02d}:{s:02d}"
-    return f"{m}:{s:02d}"
-
-def format_views(views):
-    if not views: return "غير معروف"
-    if views >= 1_000_000:
-        return f"{views/1_000_000:.1f}M".replace('.0M', 'M')
-    return str(views)
-
-def build_search_page(sid, page):
-    data = SEARCH_CACHE.get(sid)
-    if not data:
-        return "❌ انتهت صلاحية البحث، الرجاء البحث من جديد.", None
-    
-    entries = data['entries']
-    query = data['query']
-    total = len(entries)
-    
-    start_idx = page * 5
-    end_idx = start_idx + 5
-    page_entries = entries[start_idx:end_idx]
-    
-    lines = [f"🔍 نتائج بحث اليوتيوب لـ \"{query}\"\n"]
-    for entry in page_entries:
-        title = entry.get('title', 'بدون عنوان')
-        uploader = entry.get('uploader') or entry.get('channel', 'غير معروف')
-        duration = format_duration(entry.get('duration', 0))
-        views = format_views(entry.get('view_count'))
-        vid = entry.get('id', '')
-        
-        lines.append(f"🎬 {title}\n👤 {uploader}\n⏱ {duration} - 👁 {views}\n🔗 /dl_{vid}\n")
-    
-    text = "\n".join(lines)
-    
-    buttons = []
-    if end_idx < total:
-        buttons.append(InlineKeyboardButton("التالي »", callback_data=f"page_{sid}_{page+1}", style="primary"))
-    if page > 0:
-        buttons.append(InlineKeyboardButton("« السابق", callback_data=f"page_{sid}_{page-1}", style="primary"))
-        
-    markup = InlineKeyboardMarkup([buttons]) if buttons else None
-    return text, markup
-
-async def perform_youtube_search(update: Update, context: ContextTypes.DEFAULT_TYPE, query: str):
-    msg = await update.message.reply_text(f"🔍 جاري البحث الذكي عن: <b>{query}</b>...", parse_mode="HTML")
-    
-    def _search():
-        opts = {'extract_flat': True, 'quiet': True, 'default_search': 'ytsearch20'}
-        with YoutubeDL(opts) as ydl:
-            return ydl.extract_info(f"ytsearch20:{query}", download=False).get('entries', [])
-
-    try:
-        async with SEARCH_SEMAPHORE:
-            entries = await run_blocking(_search)
-    except Exception:
-        await msg.edit_text("❌ حدث خطأ أثناء تنفيذ البحث.")
-        return
-
-    if not entries:
-        await msg.edit_text("❌ لم يتم العثور على نتائج.")
-        return
-
-    sid = str(uuid.uuid4())[:8]
-    SEARCH_CACHE[sid] = {'query': query, 'entries': entries}
-    
-    text, markup = build_search_page(sid, 0)
-    await msg.edit_text(text, parse_mode="HTML", reply_markup=markup)
-
-async def search_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    
-    parts = q.data.split("_")
-    sid = parts[1]
-    page = int(parts[2])
-    
-    text, markup = build_search_page(sid, page)
-    try:
-        if "انتهت صلاحية" in text:
-            await q.message.edit_text(text)
-            return
-        await q.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
-    except Exception:
-        pass  # غالباً "message is not modified" لو المستخدم ضغط نفس الصفحة مرتين بسرعة - غير مهم
+        await update.message.reply_text("ميزة البحث قيد التطوير...")
 
 # ================== جلب معلومات الرابط ==================
 async def process_link_info(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str):
-    msg = await update.message.reply_text("⚡️ جاري تحليل الرابط...")
-
-    title = None
-    uploader = 'غير معروف'
-    thumbnail = None
-
-    try:
-        async with INFO_SEMAPHORE:
-            info = await run_blocking(_blocking_extract_info, url)
-        title = info.get('title')
-        uploader = info.get('uploader', 'غير معروف')
-        thumbnail = info.get('thumbnail')
-    except Exception:
-        try:
-            req = urllib.request.Request(f"https://www.youtube.com/oembed?url={url}&format=json", headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req) as resp:
-                data = json.loads(resp.read().decode())
-                title = data.get('title')
-                uploader = data.get('author_name', 'غير معروف')
-                thumbnail = data.get('thumbnail_url')
-        except Exception:
-            pass
-
-    if not title:
-        title = "مقطع وسائط (جاهز للتحميل)"
-        uploader = "الرابط المرفق"
-
+    # بدون أي تحليل أو استخراج معلومات - نعرض الأزرار فوراً، عشان البوت يكون أسرع وأخف
+    # ما يمكن (بدون عنوان الفيديو ولا صورة مصغرة - الثمن مقابل السرعة).
     sid = str(uuid.uuid4())[:8]
     URL_CACHE[sid] = url
 
-    caption = f"🎬 <b>{title}</b>\n👤 المصدر: {uploader}"
+    caption = "🎬 <b>رابط جاهز للتحميل</b>"
     markup = InlineKeyboardMarkup([
         [InlineKeyboardButton("🎥 فيديو MP4", callback_data=f"down_vid_{sid}", style="primary")],
         [InlineKeyboardButton("🎵 صوت MP3", callback_data=f"down_aud_{sid}", style="success"),
          InlineKeyboardButton("🎙 بصمة صوتية", callback_data=f"down_voc_{sid}", style="success")]
     ])
 
-    await msg.delete()
-    if thumbnail:
-        try:
-            await update.message.reply_photo(photo=thumbnail, caption=caption, parse_mode="HTML", reply_markup=markup)
-        except Exception:
-            await update.message.reply_text(caption, parse_mode="HTML", reply_markup=markup)
-    else:
-        await update.message.reply_text(caption, parse_mode="HTML", reply_markup=markup)
+    await update.message.reply_text(caption, parse_mode="HTML", reply_markup=markup)
 
 # ================== التحميل الذكي المحسّن والجدار الأمني ==================
 # ================== زر التبرع بنجمة (Telegram Stars) ==================
@@ -844,61 +637,34 @@ async def download_action_callback(update: Update, context: ContextTypes.DEFAULT
         }
 
     file_path = None
-    max_retries = 3
     success_download = False
 
-    # === مرحلة التحميل فقط - يتحرر السيمافور فور انتهاء التحميل ===
-    # ده بيسمح لمستخدمين تانيين يبدأوا تحميلهم فوراً حتى لو واحد لسه بيضغط فيديوه
+    # === مرحلة التحميل فقط - محاولة واحدة بس (بدون إعادة محاولة) عشان السرعة والخفة ===
     async with DOWNLOAD_SEMAPHORE:
         await status_msg.edit_text("🚀 جاري التحميل...")
+        try:
+            file_path = await asyncio.wait_for(run_blocking(_blocking_download, url, opts), timeout=90)
+            if action == "aud": file_path = file_path.rsplit('.', 1)[0] + '.mp3'
+            if action == "voc": file_path = file_path.rsplit('.', 1)[0] + '.ogg'
 
-        if not success_download:
-            for attempt in range(max_retries):
-                try:
-                    file_path = await asyncio.wait_for(run_blocking(_blocking_download, url, opts), timeout=90)
-                    if action == "aud": file_path = file_path.rsplit('.', 1)[0] + '.mp3'
-                    if action == "voc": file_path = file_path.rsplit('.', 1)[0] + '.ogg'
-
-                    if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
-                        success_download = True
-                        break
-                except asyncio.TimeoutError:
-                    logger.error(f"Attempt {attempt + 1} timed out after 90s (تعليق بدون مهلة كان يقفل الطابور بالكامل)")
-                    if attempt < max_retries - 1:
-                        await status_msg.edit_text(f"⚠️ جاري المحاولة مرة أخرى ({attempt + 2}/{max_retries})...")
-                        await asyncio.sleep(2)
-                except Exception as e:
-                    root_cause = f" | السبب الحقيقي: {e.__cause__}" if e.__cause__ else ""
-                    logger.error(f"Attempt {attempt + 1} failed: {e}{root_cause}")
-                    if attempt < max_retries - 1:
-                        await status_msg.edit_text(f"⚠️ جاري المحاولة مرة أخرى ({attempt + 2}/{max_retries})...")
-                        await asyncio.sleep(2)
-                    else:
-                        pass
+            if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+                success_download = True
+        except asyncio.TimeoutError:
+            logger.error("Download timed out after 90s")
+        except Exception as e:
+            root_cause = f" | السبب الحقيقي: {e.__cause__}" if e.__cause__ else ""
+            logger.error(f"Download failed: {e}{root_cause}")
 
     # === مرحلة الضغط والإرسال - خارج طابور التحميل، تحت سيمافور مستقل ===
     try:
         if success_download and file_path and os.path.exists(file_path) and os.path.getsize(file_path) > 0:
 
-            # جدار حماية تيليجرام: بدل ما نرفض الملفات الكبيرة، نرفعها لخدمة استضافة خارجية
-            # ونرسل رابط تحميل مباشر بدل الملف نفسه - عشان ما نقول "فشل" أبداً غير للحالات
-            # النادرة اللي حتى الاستضافة الخارجية تفشل فيها
+            # جدار حماية تيليجرام: أي ملف أكبر من 50 ميجا نرد برسالة صادقة وواضحة بدل ما نحاول
+            # حلول بديلة تثقل على الموارد - الصدق والسرعة أهم من "إيجاد حل" لكل حالة
             final_size_mb = os.path.getsize(file_path) / (1024 * 1024)
             if final_size_mb >= 49.5:
-                await status_msg.edit_text("📦 المقطع أكبر من حد تليجرام (50 ميجا)، جاري رفعه لرابط تحميل مباشر...")
-                try:
-                    async with UPLOAD_SEMAPHORE:
-                        external_url = await run_blocking(_blocking_upload_to_external_host, file_path)
-                    await q.message.reply_text(
-                        f"✅ المقطع كبير الحجم ({final_size_mb:.1f} ميجا)، تجاوز حد تليجرام للبوتات.\n"
-                        f"حمّله من هذا الرابط المباشر:\n{external_url}"
-                    )
-                    track_download_status(True, platform)
-                    await status_msg.delete()
-                except Exception as e:
-                    logger.error(f"External host upload failed: {e}")
-                    await status_msg.edit_text(f"❌ عذراً، المقطع كبير جداً ({final_size_mb:.1f} ميجا) وتعذر رفعه لرابط بديل حالياً.")
-                    track_download_status(False, platform)
+                await status_msg.edit_text(f"مقطع حجمه أكثر من 50 ميجا ({final_size_mb:.1f} ميجا) - يتجاوز حد تليجرام للبوتات، ما نقدر نرسله للأسف.")
+                track_download_status(False, platform)
                 return
 
             await status_msg.edit_text("📤 جاري إرسال الملف...")
@@ -981,7 +747,6 @@ def main():
     app.add_handler(CommandHandler("broadcast", broadcast_command))
     
     app.add_handler(CallbackQueryHandler(check_sub_callback, pattern="^check_sub$"))
-    app.add_handler(CallbackQueryHandler(search_page_callback, pattern="^page_")) 
     
     app.add_handler(CommandHandler("stats", show_stats_command))
     app.add_handler(CommandHandler("errors", show_errors_command))
@@ -995,7 +760,6 @@ def main():
     app.add_handler(CallbackQueryHandler(donate_star_callback, pattern="^donate_star$"))
     app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
-    app.add_handler(MessageHandler(filters.Regex(r"^/dl_"), handle_message))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
 
     print("🚀 تم تشغيل محرك @ZenDown_Bot بنجاح! مزود بحماية الـ OOM والجدار الأمني لتيليجرام.")
@@ -1003,6 +767,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
