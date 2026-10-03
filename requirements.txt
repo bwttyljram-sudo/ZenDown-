@@ -1,2 +1,3 @@
 python-telegram-bot
-yt-dlp[default,curl-cffi]
+yt-dlp[default]
+libsql-client
