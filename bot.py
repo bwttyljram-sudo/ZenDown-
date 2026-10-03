@@ -233,6 +233,65 @@ def save_stats():
     except Exception:
         pass
 
+# ================== الحفظ الدائم عبر Turso (اختياري) ==================
+# الملف المحلي (stats.json) ينمسح مع كل إعادة تشغيل لأن قرص Render المجاني مؤقت.
+# لو عُرّفت بيانات Turso، نحمّل آخر نسخة محفوظة عند الإقلاع، ونحفظ نسخة جديدة كل دقيقة
+# بالخلفية - بدون ما نغيّر طريقة عمل stats.json المحلي (يضل يشتغل زي ما هو، نسخة احتياطية سريعة).
+TURSO_DATABASE_URL = os.environ.get("TURSO_DATABASE_URL")
+TURSO_AUTH_TOKEN = os.environ.get("TURSO_AUTH_TOKEN")
+
+try:
+    import libsql_client
+    _LIBSQL_AVAILABLE = True
+except Exception:
+    _LIBSQL_AVAILABLE = False
+
+TURSO_ENABLED = bool(TURSO_DATABASE_URL and TURSO_AUTH_TOKEN and _LIBSQL_AVAILABLE)
+if TURSO_ENABLED:
+    print("🗄️ تم العثور على إعدادات Turso - الإحصائيات والمستخدمين بيتحفظوا بشكل دائم عبر إعادة التشغيل.")
+elif TURSO_DATABASE_URL or TURSO_AUTH_TOKEN:
+    print("⚠️ فيه إعداد Turso ناقص (الرابط أو التوكن مفقود) - رجعنا للوضع المحلي المؤقت.")
+else:
+    print("ℹ️ لا يوجد اتصال Turso - البيانات بتنمسح مع كل إعادة تشغيل (الوضع الافتراضي).")
+
+async def turso_load_on_startup():
+    """يحمّل آخر نسخة محفوظة من البيانات عند إقلاع البوت، لو موجودة."""
+    if not TURSO_ENABLED:
+        return
+    global stats
+    try:
+        async with libsql_client.create_client(url=TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN) as client:
+            await client.execute(
+                "CREATE TABLE IF NOT EXISTS bot_state (id INTEGER PRIMARY KEY, data TEXT, updated_at TEXT)"
+            )
+            rs = await client.execute("SELECT data FROM bot_state WHERE id = 1")
+            if rs.rows:
+                saved = json.loads(rs.rows[0][0])
+                stats.update(saved)
+                stats.setdefault("platform_stats", _empty_platform_stats())
+                logger.info(f"✅ Turso: تم تحميل البيانات المحفوظة ({len(stats.get('users', {}))} مستخدم).")
+            else:
+                logger.info("ℹ️ Turso: ما فيه بيانات محفوظة سابقاً، بدء من الصفر.")
+    except Exception as e:
+        logger.error(f"Turso load failed: {e}")
+
+async def turso_sync_loop():
+    """يحفظ نسخة من البيانات الحالية بـ Turso كل دقيقة - عشان ما تضيع مع أي إعادة تشغيل مستقبلية."""
+    if not TURSO_ENABLED:
+        return
+    while True:
+        await asyncio.sleep(60)
+        try:
+            async with libsql_client.create_client(url=TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN) as client:
+                payload = json.dumps(stats, ensure_ascii=False)
+                await client.execute(
+                    "INSERT INTO bot_state (id, data, updated_at) VALUES (1, ?, ?) "
+                    "ON CONFLICT(id) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at",
+                    [payload, datetime.now().isoformat()]
+                )
+        except Exception as e:
+            logger.error(f"Turso sync failed: {e}")
+
 def track_user_activity(user_id):
     stats["users"][str(user_id)] = datetime.now().isoformat()
     save_stats()
@@ -592,7 +651,9 @@ async def download_action_callback(update: Update, context: ContextTypes.DEFAULT
 
     if action == "vid":
         opts = {
-            'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+            # تخفيف شرط الصيغة: بعض المنصات (بينترست مثلاً) ترجع ملف واحد مدمج (فيديو+صوت) مو
+            # مسارين منفصلين، وكان شرط bestvideo+bestaudio الصارم يفشّل هالحالات بدون داعٍ.
+            'format': 'best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best',
             'outtmpl': out_tmpl,
             'quiet': True,
             'no_warnings': True,
@@ -738,6 +799,8 @@ async def _memory_watchdog():
 
 async def _post_init(application):
     asyncio.create_task(_memory_watchdog())
+    await turso_load_on_startup()
+    asyncio.create_task(turso_sync_loop())
 
 def main():
     app = ApplicationBuilder().token(TOKEN).concurrent_updates(True).post_init(_post_init).build()
@@ -767,6 +830,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
