@@ -275,22 +275,31 @@ async def turso_load_on_startup():
     except Exception as e:
         logger.error(f"Turso load failed: {e}")
 
+async def turso_push_now():
+    """يحفظ نسخة من البيانات الحالية بـ Turso فوراً (بدون انتظار الدورة التالية)."""
+    if not TURSO_ENABLED:
+        return
+    try:
+        async with libsql_client.create_client(url=TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN) as client:
+            payload = json.dumps(stats, ensure_ascii=False)
+            await client.execute(
+                "INSERT INTO bot_state (id, data, updated_at) VALUES (1, ?, ?) "
+                "ON CONFLICT(id) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at",
+                [payload, datetime.now().isoformat()]
+            )
+    except Exception as e:
+        logger.error(f"Turso sync failed: {e}")
+
 async def turso_sync_loop():
-    """يحفظ نسخة من البيانات الحالية بـ Turso كل دقيقة - عشان ما تضيع مع أي إعادة تشغيل مستقبلية."""
+    """
+    يحفظ نسخة من البيانات كل 20 ثانية (بدل دقيقة كاملة) - عشان نقلل فجوة الوقت اللي ممكن
+    تضيع فيها بيانات لو صارت إعادة تشغيل (خصوصاً من حارس الذاكرة) قبل أول حفظ دوري.
+    """
     if not TURSO_ENABLED:
         return
     while True:
-        await asyncio.sleep(60)
-        try:
-            async with libsql_client.create_client(url=TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN) as client:
-                payload = json.dumps(stats, ensure_ascii=False)
-                await client.execute(
-                    "INSERT INTO bot_state (id, data, updated_at) VALUES (1, ?, ?) "
-                    "ON CONFLICT(id) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at",
-                    [payload, datetime.now().isoformat()]
-                )
-        except Exception as e:
-            logger.error(f"Turso sync failed: {e}")
+        await asyncio.sleep(20)
+        await turso_push_now()
 
 def track_user_activity(user_id):
     stats["users"][str(user_id)] = datetime.now().isoformat()
@@ -792,6 +801,9 @@ async def _memory_watchdog():
                         logger.info(f"Memory watchdog: RSS={rss_mb:.0f}MB")
                         if rss_mb >= THRESHOLD_MB:
                             logger.error(f"Memory watchdog: تجاوزت الذاكرة {rss_mb:.0f}MB الحد الآمن ({THRESHOLD_MB}MB) - إعادة تشغيل منظمة الآن.")
+                            # حفظ فوري ومضمون قبل الخروج - os._exit() يقفل كل شي بالقوة بدون
+                            # أي تنظيف، فلازم نحفظ هنا صراحة قبل لا نوصل له، مو ننتظر الدورة التالية
+                            await turso_push_now()
                             os._exit(0)
                         break
         except Exception as e:
@@ -802,8 +814,13 @@ async def _post_init(application):
     await turso_load_on_startup()
     asyncio.create_task(turso_sync_loop())
 
+async def _post_shutdown(application):
+    """حفظ أخير عند أي إغلاق منظم (إعادة نشر يدوية، إيقاف من ريندر، تحديث...) - غير حالة
+    os._exit() القسرية بتاعة حارس الذاكرة، اللي لها حفظها المباشر الخاص بها."""
+    await turso_push_now()
+
 def main():
-    app = ApplicationBuilder().token(TOKEN).concurrent_updates(True).post_init(_post_init).build()
+    app = ApplicationBuilder().token(TOKEN).concurrent_updates(True).post_init(_post_init).post_shutdown(_post_shutdown).build()
     app.add_error_handler(global_error_handler)
 
     app.add_handler(CommandHandler("start", start))
@@ -830,7 +847,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
 
