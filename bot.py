@@ -238,6 +238,9 @@ def save_stats():
 # لو عُرّفت بيانات Turso، نحمّل آخر نسخة محفوظة عند الإقلاع، ونحفظ نسخة جديدة كل دقيقة
 # بالخلفية - بدون ما نغيّر طريقة عمل stats.json المحلي (يضل يشتغل زي ما هو، نسخة احتياطية سريعة).
 TURSO_DATABASE_URL = os.environ.get("TURSO_DATABASE_URL")
+# نحول الرابط من بروتوكول WebSocket (libsql://) لبروتوكول HTTP عادي (https://) - نفس قاعدة
+# البيانات بالضبط، بس HTTP أكثر توافقاً مع بيئة ريندر (WebSocket كان يفشل بخطأ 400 كل مرة).
+TURSO_HTTP_URL = TURSO_DATABASE_URL.replace("libsql://", "https://", 1) if TURSO_DATABASE_URL else None
 TURSO_AUTH_TOKEN = os.environ.get("TURSO_AUTH_TOKEN")
 
 try:
@@ -260,7 +263,7 @@ async def turso_load_on_startup():
         return
     global stats
     try:
-        async with libsql_client.create_client(url=TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN) as client:
+        async with libsql_client.create_client(url=TURSO_HTTP_URL, auth_token=TURSO_AUTH_TOKEN) as client:
             await client.execute(
                 "CREATE TABLE IF NOT EXISTS bot_state (id INTEGER PRIMARY KEY, data TEXT, updated_at TEXT)"
             )
@@ -280,7 +283,7 @@ async def turso_push_now():
     if not TURSO_ENABLED:
         return
     try:
-        async with libsql_client.create_client(url=TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN) as client:
+        async with libsql_client.create_client(url=TURSO_HTTP_URL, auth_token=TURSO_AUTH_TOKEN) as client:
             payload = json.dumps(stats, ensure_ascii=False)
             await client.execute(
                 "INSERT INTO bot_state (id, data, updated_at) VALUES (1, ?, ?) "
@@ -847,4 +850,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
