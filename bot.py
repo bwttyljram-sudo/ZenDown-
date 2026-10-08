@@ -252,6 +252,9 @@ except Exception:
 TURSO_ENABLED = bool(TURSO_DATABASE_URL and TURSO_AUTH_TOKEN and _LIBSQL_AVAILABLE)
 if TURSO_ENABLED:
     print("🗄️ تم العثور على إعدادات Turso - الإحصائيات والمستخدمين بيتحفظوا بشكل دائم عبر إعادة التشغيل.")
+    # سطر تشخيصي: يوري بالضبط أي بروتوكول يستخدم فعلياً وقت التشغيل (بدون كشف التوكن) -
+    # عشان نتأكد بدقة إنه http وليس wss بدون ما نخمن من رسائل الخطأ بس
+    print(f"🔎 Turso protocol check: TURSO_HTTP_URL starts with = {TURSO_HTTP_URL[:12]}...")
 elif TURSO_DATABASE_URL or TURSO_AUTH_TOKEN:
     print("⚠️ فيه إعداد Turso ناقص (الرابط أو التوكن مفقود) - رجعنا للوضع المحلي المؤقت.")
 else:
@@ -305,7 +308,27 @@ async def turso_sync_loop():
         await turso_push_now()
 
 def track_user_activity(user_id):
-    stats["users"][str(user_id)] = datetime.now().isoformat()
+    uid = str(user_id)
+    stats["users"][uid] = datetime.now().isoformat()
+    # أول مرة نشوف هالمستخدم - نسجل تاريخ الانضمام مرة وحدة بس (ما نكتبه فوق نفسه بعدين)
+    stats.setdefault("user_profiles", {})
+    if uid not in stats["user_profiles"]:
+        stats["user_profiles"][uid] = {
+            "joined": datetime.now().isoformat(),
+            "total_downloads": 0,
+            "platforms": {}
+        }
+    save_stats()
+
+def track_user_download(user_id, platform):
+    """يسجل تحميل ناجح لمستخدم معين - يُستخدم بس لعرض لوحة 'إحصائياتي' الشخصية."""
+    uid = str(user_id)
+    stats.setdefault("user_profiles", {})
+    profile = stats["user_profiles"].setdefault(uid, {"joined": datetime.now().isoformat(), "total_downloads": 0, "platforms": {}})
+    profile["total_downloads"] = profile.get("total_downloads", 0) + 1
+    if platform:
+        profile.setdefault("platforms", {})
+        profile["platforms"][platform] = profile["platforms"].get(platform, 0) + 1
     save_stats()
 
 def detect_platform(url: str) -> str:
@@ -385,6 +408,61 @@ async def show_all_errors_command(update: Update, context: ContextTypes.DEFAULT_
         return
     text = _format_errors_list("كل الأخطاء المسجلة (شامل تيك توك ويوتيوب)", RECENT_ERRORS)
     await update.message.reply_text(text, parse_mode="HTML")
+
+# ================== لوحة إحصائياتي (شخصية لكل مستخدم) ==================
+PLATFORM_ICONS = {
+    "يوتيوب": "▶️", "تويتر/X": "𝕏", "سناب شات": "👻", "تيك توك": "🎵",
+    "إنستغرام": "📸", "بينترست": "📌", "فيسبوك": "📘", "أخرى": "🌐"
+}
+
+async def show_my_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user:
+        return
+    uid = str(user.id)
+    profile = stats.get("user_profiles", {}).get(uid)
+
+    if not profile or profile.get("total_downloads", 0) == 0:
+        await update.message.reply_text(
+            "📊 <b>إحصائياتك</b>\n━━━━━━━\n\nما سويت أي تحميل لسا! أرسل رابط فيديو وابدأ 🚀",
+            parse_mode="HTML"
+        )
+        return
+
+    try:
+        joined_date = datetime.fromisoformat(profile["joined"]).strftime("%Y-%m-%d")
+    except Exception:
+        joined_date = "غير معروف"
+
+    total = profile.get("total_downloads", 0)
+    platforms = profile.get("platforms", {})
+    sorted_platforms = sorted(platforms.items(), key=lambda x: x[1], reverse=True)
+
+    platform_lines = []
+    for p_name, count in sorted_platforms:
+        icon = PLATFORM_ICONS.get(p_name, "▫️")
+        pct = (count / total * 100) if total > 0 else 0
+        platform_lines.append(f"{icon} {p_name}  —  {count} ({pct:.0f}%)")
+    platforms_str = "\n".join(platform_lines) if platform_lines else "لا يوجد بعد"
+
+    top_platform = sorted_platforms[0][0] if sorted_platforms else "—"
+    top_icon = PLATFORM_ICONS.get(top_platform, "▫️")
+
+    name = user.first_name or "صديقنا"
+    msg = (
+        f"📊 <b>إحصائياتك يا {name}</b>\n"
+        "━━━━━━━\n\n"
+        f"📅 عضو معنا منذ: <b>{joined_date}</b>\n"
+        f"🎬 إجمالي التحميلات: <b>{total}</b>\n"
+        f"⭐ منصتك المفضلة: {top_icon} <b>{top_platform}</b>\n"
+        "───────────────\n"
+        "🌎 <b>حسب المنصة</b>\n"
+        "───────────────\n"
+        f"{platforms_str}\n"
+        "───────────────\n\n"
+        "شكراً لاستخدامك @ZenDown_Bot 💙"
+    )
+    await update.message.reply_text(msg, parse_mode="HTML")
 
 # ================== لوحة الإحصائيات ==================
 async def show_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -748,6 +826,7 @@ async def download_action_callback(update: Update, context: ContextTypes.DEFAULT
 
             # الملف وصل بنجاح - نسجل النجاح فوراً قبل أي خطوة إضافية غير حرجة
             track_download_status(True, platform)
+            track_user_download(update.effective_user.id, platform)
             await status_msg.delete()
 
             # زر التبرع اختياري وغير حرج - أي فشل فيه (تايم آوت مثلاً) ما يجب يؤثر على نتيجة التحميل
@@ -816,6 +895,15 @@ async def _post_init(application):
     asyncio.create_task(_memory_watchdog())
     await turso_load_on_startup()
     asyncio.create_task(turso_sync_loop())
+    # تيليجرام ما يسمح بأسماء أوامر عربية (لازم إنجليزي صغير بدون مسافات)، فنسجل الأمر
+    # بالإنجليزي "mystats" لكن بوصف عربي - عشان يظهر بقائمة الأوامر لما يكتب المستخدم "/"
+    try:
+        await application.bot.set_my_commands([
+            ("start", "🚀 بدء استخدام البوت"),
+            ("mystats", "📊 إحصائياتي"),
+        ])
+    except Exception as e:
+        logger.error(f"set_my_commands failed: {e}")
 
 async def _post_shutdown(application):
     """حفظ أخير عند أي إغلاق منظم (إعادة نشر يدوية، إيقاف من ريندر، تحديث...) - غير حالة
@@ -839,6 +927,9 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(r"^(احصائيات|إحصائيات)$"), show_stats_command))
     app.add_handler(CallbackQueryHandler(show_stats_command, pattern="^refresh_stats$"))
 
+    app.add_handler(CommandHandler("mystats", show_my_stats_command))
+    app.add_handler(MessageHandler(filters.Regex(r"^(احصائياتي|إحصائياتي)$"), show_my_stats_command))
+
     app.add_handler(CallbackQueryHandler(download_action_callback, pattern="^down_"))
     app.add_handler(CallbackQueryHandler(donate_star_callback, pattern="^donate_star$"))
     app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
@@ -850,5 +941,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
