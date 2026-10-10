@@ -16,32 +16,71 @@ from telegram.ext import (
     ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, CallbackQueryHandler, PreCheckoutQueryHandler, filters
 )
 
-# تحديث تلقائي لمكتبة yt-dlp
+# تحديث تلقائي لمكتبة yt-dlp + تثبيت أداة bgutil (تجربة حل يوتيوب - تولّد "رمز إثبات أصل"
+# PO Token تلقائياً بدون الحاجة لكوكيز، باستخدام محرك Deno بدل حساب مستخدم حقيقي)
 try:
     print("🔄 جاري التحقق من تحديثات yt-dlp...")
     result = subprocess.run(
-        [sys.executable, "-m", "pip", "install", "--upgrade", "yt-dlp[default]"],
+        [sys.executable, "-m", "pip", "install", "--upgrade", "yt-dlp[default]", "bgutil-ytdlp-pot-provider"],
         capture_output=True, text=True
     )
     if result.returncode == 0:
-        print("✅ yt-dlp محدث لأحدث إصدار!")
+        print("✅ yt-dlp و bgutil-ytdlp-pot-provider محدثة!")
     else:
-        print("❌ فشل تثبيت yt-dlp[default] فعلياً! الخطأ الحقيقي:")
+        print("❌ فشل تثبيت الحزم! الخطأ الحقيقي:")
         print(result.stderr[-3000:])
 except Exception as e:
     print(f"⚠️ فشل التحديث التلقائي: {e}")
 
 from yt_dlp import YoutubeDL
 
-# طباعة نسخة yt-dlp الفعلية المثبتة
 try:
     import importlib.metadata as _im
     print(f"📦 نسخة yt-dlp المثبتة فعلياً: {_im.version('yt-dlp')}")
 except Exception as e:
     print(f"⚠️ تعذر قراءة نسخة yt-dlp: {e}")
+try:
+    print(f"📦 نسخة bgutil-ytdlp-pot-provider: {_im.version('bgutil-ytdlp-pot-provider')}")
+except Exception as e:
+    print(f"❌ bgutil-ytdlp-pot-provider غير مثبتة! السبب: {e}")
 
-# ملاحظة: هذا البوت لا يدعم تيك توك إطلاقاً (مخصص لبوت منفصل @Vdy_bot)
-# فلا حاجة لتثبيت Deno أو curl_cffi هنا - هذا يخفف البوت فعلياً (بدون محرك جافاسكريبت).
+# تثبيت Deno - محرك bgutil يحتاجه عشان يولّد رمز PO Token تلقائياً لكل فيديو يوتيوب
+try:
+    deno_check = subprocess.run(["deno", "--version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if deno_check.returncode != 0:
+        raise FileNotFoundError
+    print("✅ Deno متوفر بالفعل.")
+except Exception:
+    try:
+        print("🔄 Deno غير موجود، جاري تثبيته (مطلوب لحل يوتيوب)...")
+        subprocess.run(
+            "curl -fsSL https://deno.land/install.sh | sh -s -- -y",
+            shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120
+        )
+        deno_bin = os.path.expanduser("~/.deno/bin")
+        os.environ["PATH"] = deno_bin + os.pathsep + os.environ.get("PATH", "")
+        print("✅ تم تثبيت Deno.")
+    except Exception as e:
+        print(f"⚠️ تعذر تثبيت Deno تلقائياً: {e}")
+
+# تحميل سكربتات bgutil (المكون اللي فعلياً يولّد الرمز - مكتبة pip بس تربطه بـ yt-dlp،
+# والسكربت نفسه لازم يكون موجود محلياً). ننزّله مرة وحدة بالمسار الافتراضي اللي yt-dlp يدوّر عليه.
+_BGUTIL_HOME = os.path.expanduser("~/bgutil-ytdlp-pot-provider")
+if not os.path.exists(_BGUTIL_HOME):
+    try:
+        print("🔄 جاري تحميل سكربتات bgutil (مطلوبة لتوليد رمز يوتيوب)...")
+        subprocess.run(
+            ["git", "clone", "--depth", "1", "https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git", _BGUTIL_HOME],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60
+        )
+        if os.path.exists(_BGUTIL_HOME):
+            print("✅ تم تحميل سكربتات bgutil.")
+        else:
+            print("⚠️ فشل تحميل سكربتات bgutil - يوتيوب ممكن يستمر يفشل.")
+    except Exception as e:
+        print(f"⚠️ تعذر تحميل سكربتات bgutil: {e}")
+else:
+    print("✅ سكربتات bgutil موجودة بالفعل.")
 
 
 # ================== سيرفر الصحة لإرضاء المنصة (Render/UptimeRobot) ==================
@@ -632,6 +671,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🚧 عذراً، يجب الاشتراك بالقناة أولاً لاستخدام البوت.", reply_markup=markup)
         return
 
+    # رابط دخول مباشر (Deep Link): https://t.me/ZenDown_Bot?start=mystats
+    # لما المستخدم يفتح هالرابط، بوت تيليجرام يبعث /start mystats تلقائياً - نلتقطها هنا
+    # ونعرض لوحة الإحصائيات مباشرة بدل رسالة الترحيب العادية.
+    if context.args and context.args[0] == "mystats":
+        await show_my_stats_command(update, context)
+        return
+
     await update.message.reply_text(f"أهلاً بك <b>{user.first_name}</b> في محرك @ZenDown_Bot الذكي! 🚀\nأرسل رابطاً للتحميل، أو اكتب نصاً للبحث المباشر.", parse_mode="HTML")
 
 async def check_sub_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -660,9 +706,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         platform = track_platform_request(text)
         # فحص سريع (بدون أي تحليل أو اتصال بالإنترنت) قبل أي معالجة ثقيلة، عشان ما نضيع
         # وقت ولا موارد على روابط منصات مو مدعومة بهذا البوت
-        if platform == "يوتيوب":
-            await update.message.reply_text("عذراً، التحميل من YouTube غير متوفر حالياً.")
-        elif platform == "تيك توك":
+        if platform == "تيك توك":
             await update.message.reply_text("للتحميل من تيك توك استخدم هذا البوت @Vdy_bot")
         else:
             await process_link_info(update, context, text)
@@ -754,7 +798,9 @@ async def download_action_callback(update: Update, context: ContextTypes.DEFAULT
             'socket_timeout': 20,
             'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
             'extractor_args': {
-                'youtube': {'player_client': ['tv', 'android', 'ios', 'web']},
+                # android/ios/mweb تشتغل مع رمز bgutil التلقائي بدون أي حاجة لكوكيز (حسب دليل
+                # yt-dlp الرسمي). شلنا tv لأنها تحتاج كوكيز لأي صيغة غير محمية DRM أصلاً.
+                'youtube': {'player_client': ['android', 'ios', 'mweb', 'web']},
                 'twitter': {'api': ['syndication', 'graphql', 'legacy']}
             }
         }
@@ -770,7 +816,11 @@ async def download_action_callback(update: Update, context: ContextTypes.DEFAULT
             'geo_bypass': True,
             'nocheckcertificate': True,
             'socket_timeout': 20,
-            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+            'extractor_args': {
+                'youtube': {'player_client': ['android', 'ios', 'mweb', 'web']},
+                'twitter': {'api': ['syndication', 'graphql', 'legacy']}
+            }
         }
     else:
         opts = {
@@ -784,7 +834,11 @@ async def download_action_callback(update: Update, context: ContextTypes.DEFAULT
             'geo_bypass': True,
             'nocheckcertificate': True,
             'socket_timeout': 20,
-            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+            'extractor_args': {
+                'youtube': {'player_client': ['android', 'ios', 'mweb', 'web']},
+                'twitter': {'api': ['syndication', 'graphql', 'legacy']}
+            }
         }
 
     file_path = None
@@ -941,6 +995,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
