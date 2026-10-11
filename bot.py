@@ -645,6 +645,23 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.edit_text(f"✅ تمت عملية الإذاعة بنجاح!\n\n- نجح الإرسال إلى: {success} مستخدم\n- فشل الإرسال إلى: {failed} مستخدم (قاموا بحظر البوت غالباً)")
 
 # ================== المعالجة والتحميل ==================
+def _blocking_get_thumbnail(url):
+    """يجيب رابط الصورة المصغرة بس (بدون تحميل الفيديو) - خفيف جداً."""
+    opts = {
+        'quiet': True, 'no_warnings': True, 'cookiefile': COOKIES_FILE, 'proxy': PROXY_URL,
+        'skip_download': True, 'socket_timeout': 15,
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    }
+    with YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+        return info.get('thumbnail')
+
+def _blocking_fetch_bytes(url):
+    opener = _get_urllib_opener()
+    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+    with opener.open(req, timeout=15) as resp:
+        return resp.read()
+
 def _blocking_download(url, opts):
     with YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
@@ -724,7 +741,7 @@ async def process_link_info(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     markup = InlineKeyboardMarkup([
         [InlineKeyboardButton("🎥 فيديو MP4", callback_data=f"down_vid_{sid}", style="primary")],
         [InlineKeyboardButton("🎵 صوت MP3", callback_data=f"down_aud_{sid}", style="success"),
-         InlineKeyboardButton("🎙 بصمة صوتية", callback_data=f"down_voc_{sid}", style="success")]
+         InlineKeyboardButton("🖼 صورة", callback_data=f"down_img_{sid}", style="success")]
     ])
 
     await update.message.reply_text(caption, parse_mode="HTML", reply_markup=markup)
@@ -782,6 +799,27 @@ async def download_action_callback(update: Update, context: ContextTypes.DEFAULT
     platform = detect_platform(url)
     status_msg = await q.message.reply_text("⏳ أضيفت إلى طابور التحميل الذكي...")
     out_tmpl = f"zendown_{sid}.%(ext)s"
+
+    if action == "img":
+        try:
+            async with DOWNLOAD_SEMAPHORE:
+                await status_msg.edit_text("🖼 جاري جلب الصورة...")
+                thumb_url = await asyncio.wait_for(run_blocking(_blocking_get_thumbnail, url), timeout=30)
+            if not thumb_url:
+                raise Exception("لا يوجد صورة مصغرة لهذا الرابط")
+            img_bytes = await asyncio.wait_for(run_blocking(_blocking_fetch_bytes, thumb_url), timeout=20)
+            await q.message.reply_photo(photo=img_bytes, caption="🖼 تم بواسطة @ZenDown_Bot")
+            track_download_status(True, platform)
+            track_user_download(update.effective_user.id, platform)
+            await status_msg.delete()
+        except Exception as e:
+            logger.error(f"Image fetch failed: {e}")
+            track_download_status(False, platform)
+            await status_msg.edit_text("❌ تعذر جلب صورة لهذا الرابط.")
+        finally:
+            async with _pending_lock:
+                _pending_downloads -= 1
+        return
 
     if action == "vid":
         opts = {
@@ -995,6 +1033,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
