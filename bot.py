@@ -719,6 +719,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = update.message.text.strip()
+    if text.lower().startswith("qr "):
+        await generate_qr(update, text[3:].strip())
+        return
+
     if text.startswith("http"):
         platform = track_platform_request(text)
         # فحص سريع (بدون أي تحليل أو اتصال بالإنترنت) قبل أي معالجة ثقيلة، عشان ما نضيع
@@ -729,6 +733,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await process_link_info(update, context, text)
     else:
         await update.message.reply_text("ميزة البحث قيد التطوير...")
+
+def _blocking_make_qr(content: str):
+    import qrcode
+    from io import BytesIO
+    img = qrcode.make(content)
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return buf.getvalue()
+
+async def generate_qr(update: Update, content: str):
+    if not content:
+        await update.message.reply_text("اكتب النص أو الرابط بعد كلمة qr، مثال:\nqr https://t.me/ZenoX_Tools")
+        return
+    try:
+        img_bytes = await asyncio.wait_for(run_blocking(_blocking_make_qr, content), timeout=10)
+        await update.message.reply_photo(photo=img_bytes, caption="📱 تم توليد رمز QR بواسطة @ZenDown_Bot")
+    except Exception as e:
+        logger.error(f"QR generation failed: {e}")
+        await update.message.reply_text("❌ تعذر توليد الرمز، حاول مرة ثانية.")
 
 # ================== جلب معلومات الرابط ==================
 async def process_link_info(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str):
