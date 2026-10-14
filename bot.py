@@ -709,6 +709,13 @@ async def check_sub_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     else:
         await q.answer("❌ لم تشترك بالقناة بعد!", show_alert=True)
 
+# وضع QR: تخزين مؤقت بالذاكرة (مو بقاعدة بيانات) - مجرد "وضع" مؤقت للجلسة، يرجع تلقائياً
+# معطل لو انعاد تشغيل البوت، وهذا مقبول تماماً لأنه مو بيانات نحتاج نحافظ عليها.
+QR_MODE_USERS = set()
+
+def _qr_cancel_markup(cancel_text="إلغاء ❌", cancel_data="qr_cancel"):
+    return InlineKeyboardMarkup([[InlineKeyboardButton(cancel_text, callback_data=cancel_data, style="danger")]])
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user: return
@@ -719,8 +726,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = update.message.text.strip()
-    if text.lower().startswith("qr "):
-        await generate_qr(update, text[3:].strip())
+
+    if text.strip().lower() == "qr":
+        QR_MODE_USERS.add(user.id)
+        await update.message.reply_text(
+            "تم تفعيل خدمة QR 📱\nأرسل أي رابط لتحويله إلى صورة QR.",
+            reply_markup=_qr_cancel_markup()
+        )
+        return
+
+    # وضع QR مفعّل لهالمستخدم - أي رسالة يرسلها (رابط أو نص) تتحول QR، بدل التدفق العادي
+    if user.id in QR_MODE_USERS:
+        await generate_qr(update, text)
         return
 
     if text.startswith("http"):
@@ -734,6 +751,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("ميزة البحث قيد التطوير...")
 
+async def qr_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer("تم إلغاء تفعيل QR")
+    QR_MODE_USERS.discard(q.from_user.id)
+    try:
+        await q.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
 def _blocking_make_qr(content: str):
     import qrcode
     from io import BytesIO
@@ -745,14 +771,18 @@ def _blocking_make_qr(content: str):
 
 async def generate_qr(update: Update, content: str):
     if not content:
-        await update.message.reply_text("اكتب النص أو الرابط بعد كلمة qr، مثال:\nqr https://t.me/ZenoX_Tools")
+        await update.message.reply_text("أرسل رابط أو نص لتحويله لصورة QR.", reply_markup=_qr_cancel_markup())
         return
     try:
         img_bytes = await asyncio.wait_for(run_blocking(_blocking_make_qr, content), timeout=10)
-        await update.message.reply_photo(photo=img_bytes, caption="📱 تم توليد رمز QR بواسطة @ZenDown_Bot")
+        await update.message.reply_photo(
+            photo=img_bytes,
+            caption="✅ تم بنجاح — أرسل رابط ثاني لو تبي، أو اضغط تحت لإيقاف الميزة.",
+            reply_markup=_qr_cancel_markup("إلغاء تفعيل Qr", "qr_cancel")
+        )
     except Exception as e:
         logger.error(f"QR generation failed: {e}")
-        await update.message.reply_text("❌ تعذر توليد الرمز، حاول مرة ثانية.")
+        await update.message.reply_text("❌ تعذر توليد الرمز، حاول مرة ثانية.", reply_markup=_qr_cancel_markup())
 
 # ================== جلب معلومات الرابط ==================
 async def process_link_info(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str):
@@ -1034,6 +1064,7 @@ def main():
     app.add_handler(CommandHandler("broadcast", broadcast_command))
     
     app.add_handler(CallbackQueryHandler(check_sub_callback, pattern="^check_sub$"))
+    app.add_handler(CallbackQueryHandler(qr_cancel_callback, pattern="^qr_cancel$"))
     
     app.add_handler(CommandHandler("stats", show_stats_command))
     app.add_handler(CommandHandler("errors", show_errors_command))
@@ -1057,6 +1088,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
