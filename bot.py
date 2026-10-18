@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, LabeledPrice
 from telegram.ext import (
-    ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, CallbackQueryHandler, PreCheckoutQueryHandler, filters
+    ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, CallbackQueryHandler, PreCheckoutQueryHandler, ApplicationHandlerStop, filters
 )
 
 # تحديث تلقائي لمكتبة yt-dlp + تثبيت أداة bgutil (تجربة حل يوتيوب - تولّد "رمز إثبات أصل"
@@ -614,6 +614,60 @@ async def show_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await msg.reply_text(stats_msg, parse_mode="HTML", reply_markup=markup)
 
 # ================== الإذاعة ==================
+BROADCAST_MODE = {"on": False, "group": None}
+
+async def _do_broadcast_copy(bot, src_chat, msg_id, forwarded, reply_to, notify=True):
+    users = list(stats["users"].keys())
+    status = None
+    if notify:
+        status = await bot.send_message(chat_id=ADMIN_ID, text=f"🚀 جاري الإرسال إلى {len(users)} مستخدم...")
+    success = failed = 0
+    for uid in users:
+        try:
+            if forwarded:
+                await bot.forward_message(chat_id=int(uid), from_chat_id=src_chat, message_id=msg_id)
+            else:
+                await bot.copy_message(chat_id=int(uid), from_chat_id=src_chat, message_id=msg_id)
+            success += 1
+        except Exception:
+            failed += 1
+        await asyncio.sleep(0.05)
+    if status:
+        try:
+            await status.edit_text(f"✅ تمت الإذاعة!\n\n- نجح: {success}\n- فشل: {failed}")
+        except Exception:
+            pass
+
+async def broadcast_capture(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """يلتقط أي رسالة من الأدمن أثناء وضع الإذاعة ويرسلها للجميع كما هي (محوّلة تبقى محوّلة)."""
+    user = update.effective_user
+    m = update.effective_message
+    if not user or user.id != ADMIN_ID or not m or not BROADCAST_MODE["on"]:
+        return
+    if update.effective_chat.type != "private":
+        return
+    gid = m.media_group_id
+    if gid and BROADCAST_MODE["group"] == gid:
+        # بقية صور نفس الألبوم
+        asyncio.create_task(_do_broadcast_copy(context.bot, m.chat_id, m.message_id, bool(m.forward_origin), None, notify=False))
+        raise ApplicationHandlerStop
+    BROADCAST_MODE["on"] = False
+    BROADCAST_MODE["group"] = gid
+    asyncio.create_task(_do_broadcast_copy(context.bot, m.chat_id, m.message_id, bool(m.forward_origin), None))
+    raise ApplicationHandlerStop
+
+async def broadcast_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        await q.answer()
+        return
+    BROADCAST_MODE["on"] = False
+    await q.answer("تم إلغاء الإذاعة")
+    try:
+        await q.message.edit_text("❌ تم إلغاء الإذاعة.")
+    except Exception:
+        pass
+
 async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user or user.id != ADMIN_ID:
@@ -621,7 +675,12 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = update.message.text.replace("/broadcast", "").strip()
     if not text:
-        await update.message.reply_text("الرجاء كتابة الرسالة بعد الأمر، مثال:\n/broadcast مرحباً بالجميع!")
+        BROADCAST_MODE["on"] = True
+        BROADCAST_MODE["group"] = None
+        await update.message.reply_text(
+            "📢 تم تفعيل الإذاعة.\nأرسل الآن أي رسالة (نص/صورة/ملف/محولة من قناة...) وتنرسل للجميع كما هي تماماً.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ إلغاء الإذاعة", callback_data="bc_cancel")]])
+        )
         return
 
     users = list(stats["users"].keys())
@@ -745,7 +804,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # فحص سريع (بدون أي تحليل أو اتصال بالإنترنت) قبل أي معالجة ثقيلة، عشان ما نضيع
         # وقت ولا موارد على روابط منصات مو مدعومة بهذا البوت
         if platform == "تيك توك":
-            await update.message.reply_text("للتحميل من تيك توك استخدم هذا البوت @Vdy_bot")
+            await update.message.reply_text("للتحميل من TikTok  إستخدم هذا البوت @Gozilla_bot")
+        elif platform == "يوتيوب":
+            await update.message.reply_text("للتحميل من YouTube إستخدم هذا البوت @Gozilla_bot")
         else:
             await process_link_info(update, context, text)
     else:
@@ -1060,6 +1121,8 @@ def main():
     app = ApplicationBuilder().token(TOKEN).concurrent_updates(True).post_init(_post_init).post_shutdown(_post_shutdown).build()
     app.add_error_handler(global_error_handler)
 
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, broadcast_capture), group=-1)
+    app.add_handler(CallbackQueryHandler(broadcast_cancel_callback, pattern="^bc_cancel$"))
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("broadcast", broadcast_command))
     
@@ -1088,9 +1151,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
 
