@@ -715,6 +715,20 @@ def _blocking_get_thumbnail(url):
         info = ydl.extract_info(url, download=False)
         return info.get('thumbnail')
 
+def _blocking_get_caption(url):
+    """يجيب وصف المنشور فقط (بدون تحميل) - خفيف."""
+    opts = {
+        'quiet': True, 'no_warnings': True, 'cookiefile': COOKIES_FILE, 'proxy': PROXY_URL,
+        'skip_download': True, 'socket_timeout': 15,
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'extractor_args': {'twitter': {'api': ['syndication', 'graphql', 'legacy']}},
+    }
+    with YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+        if info.get('entries'):
+            info = next((e for e in info['entries'] if e), info)
+        return (info.get('description') or info.get('title') or '').strip()
+
 def _blocking_fetch_bytes(url):
     opener = _get_urllib_opener()
     req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
@@ -856,7 +870,8 @@ async def process_link_info(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     markup = InlineKeyboardMarkup([
         [InlineKeyboardButton("🎥 فيديو MP4", callback_data=f"down_vid_{sid}", style="primary")],
         [InlineKeyboardButton("🎵 صوت MP3", callback_data=f"down_aud_{sid}", style="success"),
-         InlineKeyboardButton("🖼 صورة", callback_data=f"down_img_{sid}", style="success")]
+         InlineKeyboardButton("🖼 صورة", callback_data=f"down_img_{sid}", style="success")],
+        [InlineKeyboardButton("📝 نسخ الوصف", callback_data=f"down_cap_{sid}", style="primary")]
     ])
 
     await update.message.reply_text(caption, parse_mode="HTML", reply_markup=markup)
@@ -897,6 +912,22 @@ async def download_action_callback(update: Update, context: ContextTypes.DEFAULT
     
     if not url:
         await q.message.reply_text("❌ انتهت صلاحية هذه الجلسة، أعد إرسال الرابط.")
+        return
+
+    if action == "cap":
+        wait = await q.message.reply_text("📝 جاري جلب الوصف...")
+        try:
+            cap = await asyncio.wait_for(run_blocking(_blocking_get_caption, url), timeout=30)
+            if not cap:
+                await wait.edit_text("ℹ️ لا يوجد وصف لهذا المنشور.")
+            else:
+                import html as _html
+                await wait.edit_text(
+                    f"📝 <b>الوصف</b> <i>(اضغط على النص للنسخ)</i>\n\n<code>{_html.escape(cap[:3800])}</code>",
+                    parse_mode="HTML")
+        except Exception as e:
+            logger.error(f"Caption fetch failed: {e}")
+            await wait.edit_text("❌ تعذر جلب الوصف لهذا الرابط.")
         return
 
     # فحص الزحمة: لو عدد الطلبات المنتظرة وصل للحد الأقصى، نرفض فوراً برسالة واضحة
