@@ -512,6 +512,7 @@ async def show_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     now = datetime.now()
     
     total_users = len(stats["users"])
+    active_now = 0
     active_today = 0
     active_7d = 0
     active_30d = 0
@@ -520,6 +521,7 @@ async def show_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         try:
             last_time = datetime.fromisoformat(last_str)
             diff = now - last_time
+            if diff <= timedelta(minutes=5): active_now += 1
             if diff <= timedelta(days=1): active_today += 1
             if diff <= timedelta(days=7): active_7d += 1
             if diff <= timedelta(days=30): active_30d += 1
@@ -575,7 +577,8 @@ async def show_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "👥 <b>المستخدمون</b>\n"
         "───────────────\n"
         f"📌 الإجمالي       : {total_users}\n"
-        f"🟢 نشطون (اليوم)  : {active_today}\n"
+        f"🟢 نشطون الآن (5 د) : {active_now}\n"
+        f"☀️ نشطون (اليوم)  : {active_today}\n"
         f"📅 نشطون (7 أيام) : {active_7d}\n"
         f"🗓 نشطون (30 يوم) : {active_30d}\n"
         "───────────────\n\n"
