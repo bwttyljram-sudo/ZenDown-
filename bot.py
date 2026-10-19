@@ -621,20 +621,46 @@ async def _do_broadcast_copy(bot, src_chat, msg_id, forwarded, reply_to, notify=
     status = None
     if notify:
         status = await bot.send_message(chat_id=ADMIN_ID, text=f"🚀 جاري الإرسال إلى {len(users)} مستخدم...")
-    success = failed = 0
+    from telegram.error import RetryAfter, Forbidden, BadRequest, TimedOut, NetworkError
+    success = blocked = other = 0
+    err_samples = {}
     for uid in users:
-        try:
-            if forwarded:
-                await bot.forward_message(chat_id=int(uid), from_chat_id=src_chat, message_id=msg_id)
-            else:
-                await bot.copy_message(chat_id=int(uid), from_chat_id=src_chat, message_id=msg_id)
-            success += 1
-        except Exception:
-            failed += 1
-        await asyncio.sleep(0.05)
+        for attempt in range(4):
+            try:
+                if forwarded:
+                    await bot.forward_message(chat_id=int(uid), from_chat_id=src_chat, message_id=msg_id)
+                else:
+                    await bot.copy_message(chat_id=int(uid), from_chat_id=src_chat, message_id=msg_id)
+                success += 1
+                break
+            except RetryAfter as e:
+                # تيليجرام طلب تبطئة (Flood) - ننتظر المدة المطلوبة ونعيد نفس المستخدم، ما نحسبه فاشل
+                await asyncio.sleep(float(getattr(e, "retry_after", 5)) + 1)
+            except (TimedOut, NetworkError):
+                await asyncio.sleep(2)
+            except Forbidden:
+                blocked += 1  # حاظر البوت فعلاً
+                break
+            except BadRequest as e:
+                if "chat not found" in str(e).lower():
+                    blocked += 1
+                else:
+                    other += 1
+                    err_samples[str(e)[:60]] = err_samples.get(str(e)[:60], 0) + 1
+                break
+            except Exception as e:
+                other += 1
+                err_samples[str(e)[:60]] = err_samples.get(str(e)[:60], 0) + 1
+                break
+        else:
+            other += 1
+            err_samples["فشل بعد 4 محاولات"] = err_samples.get("فشل بعد 4 محاولات", 0) + 1
+        await asyncio.sleep(0.06)
     if status:
+        detail = "".join(f"\n  • {k}: {v}" for k, v in list(err_samples.items())[:5])
         try:
-            await status.edit_text(f"✅ تمت الإذاعة!\n\n- نجح: {success}\n- فشل: {failed}")
+            await status.edit_text(
+                f"✅ تمت الإذاعة!\n\n- وصلت فعلاً: {success}\n- حاظرين البوت: {blocked}\n- أخطاء أخرى: {other}{detail}\n\nالمجموع: {len(users)}")
         except Exception:
             pass
 
