@@ -21,7 +21,7 @@ from telegram.ext import (
 try:
     print("🔄 جاري التحقق من تحديثات yt-dlp...")
     result = subprocess.run(
-        [sys.executable, "-m", "pip", "install", "--upgrade", "yt-dlp[default]", "bgutil-ytdlp-pot-provider"],
+        [sys.executable, "-m", "pip", "install", "--upgrade", "yt-dlp[default,curl-cffi]", "bgutil-ytdlp-pot-provider"],
         capture_output=True, text=True
     )
     if result.returncode == 0:
@@ -750,7 +750,8 @@ def _blocking_get_caption(url):
         'quiet': True, 'no_warnings': True, 'cookiefile': COOKIES_FILE, 'proxy': PROXY_URL,
         'skip_download': True, 'socket_timeout': 15,
         'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'extractor_args': {'twitter': {'api': ['syndication', 'graphql', 'legacy']}},
+        'extractor_args': {'twitter': {'api': ['syndication', 'graphql', 'legacy']},
+                'tiktok': {'api_hostname': ['api22-normal-c-useast2a.tiktokv.com']}},
     }
     with YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
@@ -817,6 +818,7 @@ def _tt_info_opts():
         'quiet': True, 'no_warnings': True, 'cookiefile': COOKIES_FILE, 'proxy': PROXY_URL,
         'skip_download': True, 'socket_timeout': 15,
         'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'extractor_args': {'tiktok': {'api_hostname': ['api22-normal-c-useast2a.tiktokv.com']}},
     }
 
 def _blocking_fetch_bytes(url):
@@ -1080,7 +1082,8 @@ async def download_action_callback(update: Update, context: ContextTypes.DEFAULT
                 # android/ios/mweb تشتغل مع رمز bgutil التلقائي بدون أي حاجة لكوكيز (حسب دليل
                 # yt-dlp الرسمي). شلنا tv لأنها تحتاج كوكيز لأي صيغة غير محمية DRM أصلاً.
                 'youtube': {'player_client': ['android', 'ios', 'mweb', 'web']},
-                'twitter': {'api': ['syndication', 'graphql', 'legacy']}
+                'twitter': {'api': ['syndication', 'graphql', 'legacy']},
+                'tiktok': {'api_hostname': ['api22-normal-c-useast2a.tiktokv.com']}
             }
         }
     elif action == "aud":
@@ -1098,7 +1101,8 @@ async def download_action_callback(update: Update, context: ContextTypes.DEFAULT
             'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
             'extractor_args': {
                 'youtube': {'player_client': ['android', 'ios', 'mweb', 'web']},
-                'twitter': {'api': ['syndication', 'graphql', 'legacy']}
+                'twitter': {'api': ['syndication', 'graphql', 'legacy']},
+                'tiktok': {'api_hostname': ['api22-normal-c-useast2a.tiktokv.com']}
             }
         }
     else:
@@ -1116,7 +1120,8 @@ async def download_action_callback(update: Update, context: ContextTypes.DEFAULT
             'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
             'extractor_args': {
                 'youtube': {'player_client': ['android', 'ios', 'mweb', 'web']},
-                'twitter': {'api': ['syndication', 'graphql', 'legacy']}
+                'twitter': {'api': ['syndication', 'graphql', 'legacy']},
+                'tiktok': {'api_hostname': ['api22-normal-c-useast2a.tiktokv.com']}
             }
         }
 
