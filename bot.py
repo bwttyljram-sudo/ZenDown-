@@ -758,6 +758,67 @@ def _blocking_get_caption(url):
             info = next((e for e in info['entries'] if e), info)
         return (info.get('description') or info.get('title') or '').strip()
 
+# ===== تشغيل yt-dlp بعملية منفصلة (معزولة) - لتيك توك فقط =====
+# لو yt-dlp علّق أو انفجر بالرام، تنقتل العملية المنفصلة وحدها والبوت يظل شغال.
+_ISOLATED_WORKER = r"""
+import sys, json
+from yt_dlp import YoutubeDL
+req = json.loads(sys.stdin.read())
+with YoutubeDL(req["opts"]) as ydl:
+    info = ydl.extract_info(req["url"], download=(req["mode"] == "download"))
+    if req["mode"] == "download":
+        out = {"file": ydl.prepare_filename(info)}
+    else:
+        if info.get("entries"):
+            info = next((e for e in info["entries"] if e), info)
+        out = {"thumbnail": info.get("thumbnail"), "description": (info.get("description") or info.get("title") or "").strip()}
+print("__RESULT__" + json.dumps(out))
+"""
+TIKTOK_INFO_SEM = asyncio.Semaphore(1)
+ISOLATED_TIMEOUT = 45
+ISOLATED_MEM_BYTES = 1500 * 1024 * 1024
+
+def _is_tiktok(url):
+    return "tiktok.com" in (url or "").lower()
+
+async def run_isolated(mode, url, opts):
+    import resource, signal
+    def _limits():
+        os.setsid()
+        try: resource.setrlimit(resource.RLIMIT_AS, (ISOLATED_MEM_BYTES, ISOLATED_MEM_BYTES))
+        except Exception: pass
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", _ISOLATED_WORKER,
+        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        preexec_fn=_limits)
+    try:
+        payload = json.dumps({"mode": mode, "url": url, "opts": opts}).encode()
+        out, err = await asyncio.wait_for(proc.communicate(payload), timeout=ISOLATED_TIMEOUT)
+    except asyncio.TimeoutError:
+        try: os.killpg(proc.pid, signal.SIGKILL)
+        except Exception:
+            try: proc.kill()
+            except Exception: pass
+        try: await proc.wait()
+        except Exception: pass
+        raise asyncio.TimeoutError()
+    finally:
+        if proc.returncode is None:
+            try: os.killpg(proc.pid, signal.SIGKILL)
+            except Exception: pass
+    text = (out or b"").decode(errors="ignore")
+    for line in reversed(text.splitlines()):
+        if line.startswith("__RESULT__"):
+            return json.loads(line[len("__RESULT__"):])
+    raise Exception("isolated worker failed: " + (err or b"").decode(errors="ignore")[-400:])
+
+def _tt_info_opts():
+    return {
+        'quiet': True, 'no_warnings': True, 'cookiefile': COOKIES_FILE, 'proxy': PROXY_URL,
+        'skip_download': True, 'socket_timeout': 15,
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    }
+
 def _blocking_fetch_bytes(url):
     opener = _get_urllib_opener()
     req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
@@ -846,9 +907,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         platform = track_platform_request(text)
         # فحص سريع (بدون أي تحليل أو اتصال بالإنترنت) قبل أي معالجة ثقيلة، عشان ما نضيع
         # وقت ولا موارد على روابط منصات مو مدعومة بهذا البوت
-        if platform == "تيك توك":
-            await update.message.reply_text("للتحميل من TikTok  إستخدم هذا البوت @Gozilla_bot")
-        elif platform == "يوتيوب":
+        if platform == "يوتيوب":
             await update.message.reply_text("للتحميل من YouTube إستخدم هذا البوت @Gozilla_bot")
         else:
             await process_link_info(update, context, text)
@@ -946,7 +1005,11 @@ async def download_action_callback(update: Update, context: ContextTypes.DEFAULT
     if action == "cap":
         wait = await q.message.reply_text("📝 جاري جلب الوصف...")
         try:
-            cap = await asyncio.wait_for(run_blocking(_blocking_get_caption, url), timeout=30)
+            if _is_tiktok(url):
+                async with TIKTOK_INFO_SEM:
+                    cap = (await run_isolated("info", url, _tt_info_opts())).get("description", "")
+            else:
+                cap = await asyncio.wait_for(run_blocking(_blocking_get_caption, url), timeout=30)
             if not cap:
                 await wait.edit_text("ℹ️ لا يوجد وصف لهذا المنشور.")
             else:
@@ -979,7 +1042,10 @@ async def download_action_callback(update: Update, context: ContextTypes.DEFAULT
         try:
             async with DOWNLOAD_SEMAPHORE:
                 await status_msg.edit_text("🖼 جاري جلب الصورة...")
-                thumb_url = await asyncio.wait_for(run_blocking(_blocking_get_thumbnail, url), timeout=30)
+                if _is_tiktok(url):
+                    thumb_url = (await run_isolated("info", url, _tt_info_opts())).get("thumbnail")
+                else:
+                    thumb_url = await asyncio.wait_for(run_blocking(_blocking_get_thumbnail, url), timeout=30)
             if not thumb_url:
                 raise Exception("لا يوجد صورة مصغرة لهذا الرابط")
             img_bytes = await asyncio.wait_for(run_blocking(_blocking_fetch_bytes, thumb_url), timeout=20)
@@ -1061,7 +1127,10 @@ async def download_action_callback(update: Update, context: ContextTypes.DEFAULT
     async with DOWNLOAD_SEMAPHORE:
         await status_msg.edit_text("🚀 جاري التحميل...")
         try:
-            file_path = await asyncio.wait_for(run_blocking(_blocking_download, url, opts), timeout=90)
+            if _is_tiktok(url):
+                file_path = (await run_isolated("download", url, opts))["file"]
+            else:
+                file_path = await asyncio.wait_for(run_blocking(_blocking_download, url, opts), timeout=90)
             if action == "aud": file_path = file_path.rsplit('.', 1)[0] + '.mp3'
             if action == "voc": file_path = file_path.rsplit('.', 1)[0] + '.ogg'
 
