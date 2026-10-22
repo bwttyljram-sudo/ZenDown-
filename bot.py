@@ -587,9 +587,7 @@ async def show_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"🔢 إجمالي الطلبات  : {total_req}\n"
         f"✅ ناجحة         : {success_dl}\n"
         f"❌ فاشلة         : {failed_dl}\n"
-        f"⚡️ من الكاش       : {cache_hits}\n"
         f"🎬 فيديوهات أُرسلت : {sent_vids}\n"
-        f"🛡 حد الطلبات     : {req_limits}\n"
         "───────────────\n\n"
         "🌎 <b>المنصات الأكثر طلباً</b>\n"
         "───────────────\n"
@@ -597,8 +595,6 @@ async def show_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "───────────────\n\n"
         "⚡️ <b>الأداء</b>\n"
         "───────────────\n"
-        f"🔗 ضغطات المشاركة : {share_clicks}\n"
-        f"💾 Cache Hit Rate : 0.0%\n"
         f"✅ معدل النجاح     : {rate:.1f}%\n"
         f"🌟 تبرعات بالنجوم  : {star_donations}\n"
         "───────────────\n\n"
@@ -909,10 +905,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         platform = track_platform_request(text)
         # فحص سريع (بدون أي تحليل أو اتصال بالإنترنت) قبل أي معالجة ثقيلة، عشان ما نضيع
         # وقت ولا موارد على روابط منصات مو مدعومة بهذا البوت
-        if platform == "يوتيوب":
-            await update.message.reply_text("للتحميل من YouTube إستخدم هذا البوت @Gozilla_bot")
-        else:
-            await process_link_info(update, context, text)
+        await process_link_info(update, context, text)
     else:
         await update.message.reply_text("ميزة البحث قيد التطوير...")
 
