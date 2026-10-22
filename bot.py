@@ -432,6 +432,35 @@ def _format_errors_list(title, errors_deque):
             break
     return text
 
+async def cookies_check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """للأدمن فقط: يفحص ملف الكوكيز (بدون إظهار أي قيمة سرية)."""
+    user = update.effective_user
+    if not user or user.id != ADMIN_ID:
+        return
+    path = "/etc/secrets/cookies.txt"
+    if not os.path.exists(path):
+        await update.message.reply_text("❌ ملف الكوكيز غير موجود في السيرفر (المسار: /etc/secrets/cookies.txt).\nتأكد من اسم الملف في Secret Files.")
+        return
+    try:
+        raw = open(path, encoding="utf-8", errors="ignore").read()
+    except Exception as e:
+        await update.message.reply_text(f"❌ تعذر قراءة الملف: {e}")
+        return
+    lines = [l for l in raw.splitlines() if l.strip() and not l.startswith("#")]
+    good = [l.split("\t") for l in lines if len(l.split("\t")) == 7]
+    bad = len(lines) - len(good)
+    names = sorted({r[5] for r in good if "youtube.com" in r[0] or "google.com" in r[0]})
+    first = raw.splitlines()[0][:40] if raw.strip() else "(فارغ)"
+    await update.message.reply_text(
+        f"🍪 <b>فحص الكوكيز</b>\n"
+        f"الملف موجود ✅ ({len(raw)} حرف)\n"
+        f"السطر الأول: <code>{first}</code>\n"
+        f"أسطر صحيحة (7 حقول): {len(good)}\n"
+        f"أسطر خاطئة: {bad}\n"
+        f"كوكيز يوتيوب/قوقل: {', '.join(names) if names else 'لا يوجد'}\n"
+        f"البوت يستخدم الملف: {'نعم ✅' if COOKIES_FILE else 'لا ❌ (أعد تشغيل البوت)'}",
+        parse_mode="HTML")
+
 async def show_errors_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """يعرض أخطاء المنصات الأخرى فقط (بدون تيك توك ويوتيوب) عشان ما تنطمر بضجيج تيك توك المتكرر."""
     user = update.effective_user
@@ -1257,6 +1286,8 @@ def main():
     app.add_handler(CallbackQueryHandler(qr_cancel_callback, pattern="^qr_cancel$"))
     
     app.add_handler(CommandHandler("stats", show_stats_command))
+    app.add_handler(CommandHandler("cookies", cookies_check_command))
+    app.add_handler(MessageHandler(filters.Regex(r"^(كوكيز|الكوكيز)$"), cookies_check_command))
     app.add_handler(CommandHandler("errors", show_errors_command))
     app.add_handler(CommandHandler("all_errors", show_all_errors_command))
     app.add_handler(MessageHandler(filters.Regex(r"^(اخطاء|أخطاء)$"), show_errors_command))
