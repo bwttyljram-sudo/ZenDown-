@@ -138,8 +138,17 @@ ADMIN_ID = 6043858925
 
 # ملف كوكيز اختياري - لو رفعته كـ Secret File بـ Render باسم cookies.txt
 # بيُستخدم تلقائياً لتجاوز حظر تيك توك، بدون أي تعديل إضافي بالكود
-COOKIES_FILE = "/etc/secrets/cookies.txt"
-COOKIES_FILE = COOKIES_FILE if os.path.exists(COOKIES_FILE) else None
+COOKIES_SECRET_PATH = "/etc/secrets/cookies.txt"
+COOKIES_FILE = None
+# ملفات Render السرية للقراءة فقط، بينما yt-dlp يحاول يكتب على ملف الكوكيز عند الإغلاق
+# (فيطلع خطأ Read-only file system). الحل: ننسخ الملف لمكان قابل للكتابة ونستخدم النسخة.
+if os.path.exists(COOKIES_SECRET_PATH):
+    try:
+        import shutil
+        shutil.copyfile(COOKIES_SECRET_PATH, "/tmp/cookies.txt")
+        COOKIES_FILE = "/tmp/cookies.txt"
+    except Exception as _e:
+        print(f"⚠️ تعذر نسخ ملف الكوكيز: {_e}")
 if COOKIES_FILE:
     print("🍪 تم العثور على ملف كوكيز، سيتم استخدامه لتحسين التحميل من تيك توك.")
 else:
