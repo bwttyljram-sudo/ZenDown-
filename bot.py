@@ -1265,6 +1265,17 @@ async def _post_init(application):
             ("start", "🚀 بدء استخدام البوت"),
             ("mystats", "📊 إحصائياتي"),
         ])
+        # أوامر الأدمن - تظهر لك أنت فقط في قائمة "/" (المستخدمون العاديون ما يشوفونها)
+        from telegram import BotCommandScopeChat
+        await application.bot.set_my_commands([
+            ("start", "🚀 بدء استخدام البوت"),
+            ("mystats", "📊 إحصائياتي"),
+            ("stats", "📈 إحصائيات البوت"),
+            ("broadcast", "📢 تفعيل الإذاعة"),
+            ("all_errors", "🛑 كل الأخطاء (شامل تيك توك ويوتيوب)"),
+            ("errors", "⚠️ أخطاء المنصات الأخرى"),
+            ("cookies", "🍪 فحص الكوكيز"),
+        ], scope=BotCommandScopeChat(chat_id=ADMIN_ID))
     except Exception as e:
         logger.error(f"set_my_commands failed: {e}")
 
@@ -1309,4 +1320,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
