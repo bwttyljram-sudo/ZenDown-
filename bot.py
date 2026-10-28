@@ -943,7 +943,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         platform = track_platform_request(text)
         # فحص سريع (بدون أي تحليل أو اتصال بالإنترنت) قبل أي معالجة ثقيلة، عشان ما نضيع
         # وقت ولا موارد على روابط منصات مو مدعومة بهذا البوت
-        await process_link_info(update, context, text)
+        if platform == "يوتيوب":
+            await update.message.reply_text("للتحميل من YouTube إستخدم هذا البوت @Gozilla_bot")
+        else:
+            await process_link_info(update, context, text)
     else:
         await update.message.reply_text("ميزة البحث قيد التطوير...")
 
@@ -1099,7 +1102,7 @@ async def download_action_callback(update: Update, context: ContextTypes.DEFAULT
         opts = {
             # تخفيف شرط الصيغة: بعض المنصات (بينترست مثلاً) ترجع ملف واحد مدمج (فيديو+صوت) مو
             # مسارين منفصلين، وكان شرط bestvideo+bestaudio الصارم يفشّل هالحالات بدون داعٍ.
-            'format': 'best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best',
+            'format': 'best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best/bv*+ba/bv*',
             'outtmpl': out_tmpl,
             'quiet': True,
             'no_warnings': True,
@@ -1329,5 +1332,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
