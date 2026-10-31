@@ -6,6 +6,7 @@ import os
 import uuid
 import threading
 import json
+import re
 import urllib.request
 import urllib.error
 import time
@@ -526,9 +527,12 @@ async def show_my_stats_command(update: Update, context: ContextTypes.DEFAULT_TY
     top_icon = PLATFORM_ICONS.get(top_platform, "▫️")
 
     name = user.first_name or "صديقنا"
+    _pu = premium_until(user.id)
+    pro_line = f"👑 <b>Pro</b> فعّال حتى {_pu.strftime('%Y-%m-%d')}\n" if _pu else ""
     msg = (
         f"📊 <b>إحصائياتك يا {name}</b>\n"
         "━━━━━━━\n\n"
+        f"{pro_line}"
         f"📅 عضو معنا منذ: <b>{joined_date}</b>\n"
         f"🎬 إجمالي التحميلات: <b>{total}</b>\n"
         f"⭐ منصتك المفضلة: {top_icon} <b>{top_platform}</b>\n"
@@ -635,6 +639,9 @@ async def show_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "───────────────\n"
         f"✅ معدل النجاح     : {rate:.1f}%\n"
         f"🌟 تبرعات بالنجوم  : {star_donations}\n"
+        f"⭐ النجوم المستلمة  : {stats.get('stars_received', 0)}\n"
+        f"👑 مشتركو Pro الآن : {sum(1 for _u in stats.get('premium', {}) if is_premium(_u))}\n"
+        f"🧾 اشتراكات مباعة  : {stats.get('plan_sales', 0)}\n"
         "───────────────\n\n"
         f"⏰ <b>وقت التشغيل:</b> {days} يوم {hours} ساعة {minutes} دقيقة\n"
         "🔄 <b>تحديث الإحصائيات:</b> كل 100 حدث أو عند الإيقاف"
@@ -939,6 +946,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await generate_qr(update, text)
         return
 
+    # وضع القص (Pro): ينتظر نطاق مثل 0:10-0:40
+    if user.id in TRIM_PENDING and not text.startswith("http"):
+        sid = TRIM_PENDING[user.id]
+        rng = parse_trim_range(text)
+        if not rng or rng[1] <= rng[0] or (rng[1] - rng[0]) > TRIM_MAX_SECONDS:
+            await update.message.reply_text(
+                f"⚠️ اكتب النطاق بهذا الشكل: <code>0:10-0:40</code>\nالحد الأقصى للقص {TRIM_MAX_SECONDS} ثانية، والنهاية بعد البداية.",
+                parse_mode="HTML")
+            return
+        TRIM_RANGE[f"{user.id}:{sid}"] = rng
+        TRIM_PENDING.pop(user.id, None)
+        await update.message.reply_text(
+            f"✂️ جاهز: من <b>{text.split('-')[0].strip()}</b> إلى <b>{text.split('-')[-1].strip()}</b> ({rng[1]-rng[0]} ثانية)\nاضغط للبدء 👇",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✂️ ابدأ القص", callback_data=f"down_cut_{sid}", style="success")]]))
+        return
+    TRIM_PENDING.pop(user.id, None)
+
     if text.startswith("http"):
         platform = track_platform_request(text)
         # فحص سريع (بدون أي تحليل أو اتصال بالإنترنت) قبل أي معالجة ثقيلة، عشان ما نضيع
@@ -993,15 +1018,265 @@ async def process_link_info(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     caption = "🎬 <b>رابط جاهز للتحميل</b>"
     markup = InlineKeyboardMarkup([
         [InlineKeyboardButton("🎥 فيديو MP4", callback_data=f"down_vid_{sid}", style="primary")],
-        [InlineKeyboardButton("🎵 صوت MP3", callback_data=f"down_aud_{sid}", style="success"),
+        [InlineKeyboardButton("🎵 صوت MP3" + (" + غلاف 👑" if is_premium(update.effective_user.id) else ""), callback_data=f"down_aud_{sid}", style="success"),
          InlineKeyboardButton("🖼 صورة", callback_data=f"down_img_{sid}", style="success")],
-        [InlineKeyboardButton("📝 نسخ الوصف", callback_data=f"down_cap_{sid}", style="primary")]
+        [InlineKeyboardButton("📝 نسخ الوصف", callback_data=f"down_cap_{sid}", style="primary")],
+        [InlineKeyboardButton("تعديل المقطع 🎬", callback_data=f"down_trm_{sid}", style="primary")]
     ])
 
     await update.message.reply_text(caption, parse_mode="HTML", reply_markup=markup)
 
 # ================== التحميل الذكي المحسّن والجدار الأمني ==================
 # ================== زر التبرع بنجمة (Telegram Stars) ==================
+# ================== اشتراك Pro (باقات بالنجوم) ==================
+PLANS = {
+    "daily":   {"stars": 5,  "days": 1,  "label": "يومي",   "badge": ""},
+    "weekly":  {"stars": 15, "days": 7,  "label": "أسبوعي", "badge": ""},
+    "monthly": {"stars": 30, "days": 30, "label": "شهري",   "badge": "🔥 الأوفر"},
+}
+TRIM_PENDING = {}   # user_id -> sid  (ينتظر نطاق القص)
+TRIM_RANGE = {}     # f"{user_id}:{sid}" -> (start, end)
+TRIM_MAX_SECONDS = 60
+FILTER_MAX_SECONDS = 30
+FILTERS = {
+    "bw":      ("⚫ أبيض وأسود", "hue=s=0"),
+    "sepia":   ("🟤 سيبيا", "colorchannelmixer=.393:.769:.189:0:.349:.686:.168:0:.272:.534:.131:0"),
+    "warm":    ("🔥 دافئ", "colorbalance=rs=.18:gs=.04:bs=-.18,eq=saturation=1.15"),
+    "cool":    ("❄️ بارد", "colorbalance=rs=-.18:bs=.2,eq=saturation=1.05"),
+    "vivid":   ("🌈 حيوي", "eq=brightness=0.05:contrast=1.12:saturation=1.5"),
+    "drama":   ("🎭 درامي", "eq=contrast=1.35:saturation=0.85:brightness=-0.03,vignette=PI/5"),
+    "vintage": ("📼 قديم", "curves=preset=vintage"),
+    "mirror":  ("🪞 انعكاس", "hflip"),
+}
+FILTER_CHOICE = {}              # f"{user_id}:{sid}" -> filter key
+THUMB_CACHE = BoundedCache(max_size=60)   # sid -> bytes (صورة المعاينة)
+
+def is_premium(user_id) -> bool:
+    try:
+        if int(user_id) == ADMIN_ID:   # الأدمن يتمتع بكل مزايا Pro مجاناً
+            return True
+        exp = stats.get("premium", {}).get(str(user_id))
+        return bool(exp) and datetime.fromisoformat(exp) > datetime.now()
+    except Exception:
+        return False
+
+def premium_until(user_id):
+    try:
+        exp = stats.get("premium", {}).get(str(user_id))
+        if exp and datetime.fromisoformat(exp) > datetime.now():
+            return datetime.fromisoformat(exp)
+    except Exception:
+        pass
+    return None
+
+def _plans_text(user_id) -> str:
+    until = premium_until(user_id)
+    status = f"✅ اشتراكك فعّال حتى <b>{until.strftime('%Y-%m-%d %H:%M')}</b>\n\n" if until else ""
+    return (
+        "👑 <b>ZenDown Pro</b>\n"
+        "━━━━━━━\n\n"
+        f"{status}"
+        "البوت يبقى <b>مجاني بالكامل</b> كما هو، وPro إضافة اختيارية لمن يبي مزايا أكثر:\n\n"
+        "🚀 <b>تخطي الطابور</b> — ما يُرفض طلبك وقت الازدحام\n"
+        "✂️ <b>قص المقطع</b> — خذ الجزء اللي تبيه فقط (حتى 60 ثانية)\n"
+        "🎧 <b>MP3 كامل</b> — الصوت يوصلك باسمه وصورة الغلاف\n"
+        "👑 <b>شارة Pro</b> في إحصائياتك\n\n"
+        "───────────────\n"
+        "⭐ <b>الباقات</b>\n"
+        "───────────────\n"
+        "▫️ يومي — 5 ⭐\n"
+        "▫️ أسبوعي — 15 ⭐\n"
+        "▫️ شهري — 30 ⭐  🔥 الأوفر\n\n"
+        "اختر باقتك من الأزرار 👇"
+    )
+
+def _plans_markup():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔥 شهري — 30 ⭐", callback_data="buy_monthly", style="primary")],
+        [InlineKeyboardButton("أسبوعي — 15 ⭐", callback_data="buy_weekly"),
+         InlineKeyboardButton("يومي — 5 ⭐", callback_data="buy_daily")],
+    ])
+
+async def pro_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not update.message:
+        return
+    track_user_activity(user.id)
+    await update.message.reply_text(_plans_text(user.id), parse_mode="HTML", reply_markup=_plans_markup())
+
+async def pro_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await q.message.reply_text(_plans_text(q.from_user.id), parse_mode="HTML", reply_markup=_plans_markup())
+
+async def buy_plan_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    key = q.data.replace("buy_", "")
+    plan = PLANS.get(key)
+    if not plan:
+        return
+    try:
+        await context.bot.send_invoice(
+            chat_id=q.message.chat_id,
+            title=f"ZenDown Pro — {plan['label']}",
+            description=f"اشتراك Pro لمدة {plan['days']} يوم: تخطي الطابور + قص المقطع + MP3 كامل.",
+            payload=f"plan_{key}",
+            currency="XTR",
+            prices=[LabeledPrice(f"Pro {plan['label']}", plan["stars"])],
+        )
+    except Exception as e:
+        logger.error(f"Failed to send plan invoice: {e}")
+        await q.message.reply_text("❌ تعذر فتح نافذة الدفع حالياً، حاول لاحقاً.")
+
+async def paysupport_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "💬 <b>دعم المدفوعات</b>\n\nإذا دفعت ولم يتفعّل اشتراكك، أو عندك أي مشكلة بالدفع، "
+        "تواصل معنا عبر قناتنا @ZenoX_Tools مع ذكر وقت الدفع، وراح نساعدك.",
+        parse_mode="HTML")
+
+async def qr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not update.message:
+        return
+    track_user_activity(user.id)
+    if not await check_user_subscription(context.bot, user.id):
+        await update.message.reply_text("🚧 يرجى الاشتراك في القناة أولاً.")
+        return
+    if context.args:
+        await generate_qr(update, " ".join(context.args))
+        return
+    QR_MODE_USERS.add(user.id)
+    await update.message.reply_text(
+        "تم تفعيل خدمة QR 📱\nأرسل أي رابط أو نص لتحويله إلى صورة QR.",
+        reply_markup=_qr_cancel_markup())
+
+def _parse_time(t: str):
+    parts = [int(x) for x in t.strip().split(":")]
+    sec = 0
+    for p in parts:
+        sec = sec * 60 + p
+    return sec
+
+def parse_trim_range(text: str):
+    m = re.match(r"^\s*(\d+(?::\d+){0,2})\s*(?:-|–|—|الى|إلى|to)\s*(\d+(?::\d+){0,2})\s*$", text.strip(), re.I)
+    if not m:
+        return None
+    try:
+        return _parse_time(m.group(1)), _parse_time(m.group(2))
+    except Exception:
+        return None
+
+async def _blocking_ffmpeg_cut(src, dst, start, dur):
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-y", "-loglevel", "error", "-ss", str(start), "-i", src, "-t", str(dur),
+        "-c", "copy", "-avoid_negative_ts", "make_zero", dst,
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=60)
+    except asyncio.TimeoutError:
+        try: proc.kill()
+        except Exception: pass
+        raise
+    return proc.returncode == 0 and os.path.exists(dst) and os.path.getsize(dst) > 0
+
+async def _ffmpeg_exec(args, timeout):
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-y", "-loglevel", "error", *args,
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=timeout)
+    except asyncio.TimeoutError:
+        try: proc.kill()
+        except Exception: pass
+        raise
+    return proc.returncode == 0
+
+async def _ffmpeg_apply_filter(src, dst, vf):
+    """يطبّق الفلتر على أول FILTER_MAX_SECONDS ثانية (إعادة ترميز خفيفة: ultrafast، حد أقصى 720p)."""
+    ok = await _ffmpeg_exec([
+        "-t", str(FILTER_MAX_SECONDS), "-i", src,
+        "-vf", f"{vf},scale=-2:'min(720,trunc(ih/2)*2)'",
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-threads", "1",
+        "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", dst], timeout=150)
+    return ok and os.path.exists(dst) and os.path.getsize(dst) > 0
+
+async def _filter_preview_image(img_bytes, vf, tag):
+    src, dst = f"prev_in_{tag}.jpg", f"prev_out_{tag}.jpg"
+    try:
+        with open(src, "wb") as f:
+            f.write(img_bytes)
+        ok = await _ffmpeg_exec(["-i", src, "-vf", vf, "-frames:v", "1", "-q:v", "3", dst], timeout=20)
+        if ok and os.path.exists(dst):
+            with open(dst, "rb") as f:
+                return f.read()
+        return None
+    finally:
+        for p in (src, dst):
+            try: os.remove(p)
+            except Exception: pass
+
+def _filters_markup(sid):
+    keys = list(FILTERS.keys())
+    rows = []
+    for i in range(0, len(keys), 2):
+        rows.append([InlineKeyboardButton(FILTERS[k][0], callback_data=f"flp_{k}_{sid}") for k in keys[i:i+2]])
+    return InlineKeyboardMarkup(rows)
+
+async def _pro_upsell(q):
+    await q.message.reply_text(
+        "🎬 <b>تعديل المقطع</b> ميزة مخصصة لمشتركي <b>Pro</b> 👑\n"
+        "قص المقاطع وإضافة الفلاتر.\n"
+        "<i>البوت يبقى مجاني، وPro اختياري 👇</i>\n\n"
+        + _plans_text(q.from_user.id),
+        parse_mode="HTML", reply_markup=_plans_markup())
+
+async def filter_preview_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    uid = q.from_user.id
+    if not is_premium(uid):
+        await q.answer()
+        await _pro_upsell(q)
+        return
+    try:
+        _, key, sid = q.data.split("_")
+    except Exception:
+        await q.answer()
+        return
+    if key not in FILTERS:
+        await q.answer()
+        return
+    url = URL_CACHE.get(sid)
+    if not url:
+        await q.answer("انتهت صلاحية الجلسة، أعد إرسال الرابط", show_alert=True)
+        return
+    await q.answer("⏳ جاري تجهيز المعاينة...")
+    try:
+        img = THUMB_CACHE.get(sid)
+        if not img:
+            if _is_tiktok(url):
+                async with TIKTOK_INFO_SEM:
+                    thumb_url = (await run_isolated("info", url, _tt_info_opts())).get("thumbnail")
+            else:
+                thumb_url = await asyncio.wait_for(run_blocking(_blocking_get_thumbnail, url), timeout=30)
+            if not thumb_url:
+                raise Exception("no thumbnail")
+            img = await asyncio.wait_for(run_blocking(_blocking_fetch_bytes, thumb_url), timeout=20)
+            THUMB_CACHE[sid] = img
+        label, vf = FILTERS[key]
+        out = await _filter_preview_image(img, vf, f"{uid}_{sid}_{key}")
+        if not out:
+            raise Exception("preview failed")
+        FILTER_CHOICE[f"{uid}:{sid}"] = key
+        await q.message.reply_photo(
+            photo=out,
+            caption=f"🎨 معاينة الفلتر: <b>{label}</b>\n<i>يُطبَّق على أول {FILTER_MAX_SECONDS} ثانية من المقطع</i>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ تطبيق الفلتر", callback_data=f"down_flt_{sid}", style="success")]]))
+    except Exception as e:
+        logger.error(f"Filter preview failed: {e}")
+        await q.message.reply_text("❌ تعذرت معاينة الفلتر لهذا الرابط.")
+
 async def donate_star_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -1023,6 +1298,26 @@ async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.answer(ok=True)
 
 async def successful_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    sp = update.message.successful_payment
+    payload = sp.invoice_payload or ""
+    stats["stars_received"] = stats.get("stars_received", 0) + int(sp.total_amount or 0)
+    if payload.startswith("plan_") and payload[5:] in PLANS:
+        plan = PLANS[payload[5:]]
+        uid = str(update.effective_user.id)
+        stats.setdefault("premium", {})
+        # لو اشتراكه فعّال نمدّد من تاريخ الانتهاء، وإلا من الآن
+        base = premium_until(uid) or datetime.now()
+        new_exp = base + timedelta(days=plan["days"])
+        stats["premium"][uid] = new_exp.isoformat()
+        stats["plan_sales"] = stats.get("plan_sales", 0) + 1
+        save_stats()
+        await update.message.reply_text(
+            f"🎉 <b>أهلاً بك في ZenDown Pro!</b>\n\n"
+            f"✅ تم تفعيل الباقة <b>{plan['label']}</b>\n"
+            f"📅 تنتهي في: <b>{new_exp.strftime('%Y-%m-%d %H:%M')}</b>\n\n"
+            "مزاياك الآن:\n🚀 تخطي الطابور\n✂️ قص المقطع (زر ✂️ تحت أي رابط)\n🎧 MP3 باسمه وغلافه\n\nشكراً لدعمك 💙",
+            parse_mode="HTML")
+        return
     stats["star_donations"] = stats.get("star_donations", 0) + 1
     save_stats()
     await update.message.reply_text("🌟 شكراً جزيلاً على دعمك! هذا يساعدنا نستمر ونطوّر البوت. 💙")
@@ -1058,14 +1353,73 @@ async def download_action_callback(update: Update, context: ContextTypes.DEFAULT
             await wait.edit_text("❌ تعذر جلب الوصف لهذا الرابط.")
         return
 
+    uid_now = q.from_user.id
+    premium = is_premium(uid_now)
+
+    if action == "trm":
+        if not premium:
+            await _pro_upsell(q)
+            return
+        await q.message.reply_text(
+            "🎬 <b>تعديل المقطع</b>\nاختر ما تبيه 👇",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🎨 إضافة فلاتر", callback_data=f"down_fmenu_{sid}", style="primary")],
+                [InlineKeyboardButton("✂️ قص الفيديو", callback_data=f"down_cutm_{sid}", style="primary")],
+            ]))
+        return
+
+    if action == "fmenu":
+        if not premium:
+            await _pro_upsell(q)
+            return
+        await q.message.reply_text(
+            "🎨 <b>الفلاتر</b>\nاضغط على فلتر لمعاينته على صورة من المقطع، ثم اختر تطبيق 👇\n"
+            f"<i>الفلاتر تُطبَّق على أول {FILTER_MAX_SECONDS} ثانية.</i>",
+            parse_mode="HTML", reply_markup=_filters_markup(sid))
+        return
+
+    if action == "cutm":
+        if not premium:
+            await _pro_upsell(q)
+            return
+        TRIM_PENDING[uid_now] = sid
+        await q.message.reply_text(
+            f"✂️ <b>قص الفيديو</b>\nأرسل المدة اللي تبيها بهذا الشكل:\n<code>0:10-0:40</code>\n(الحد الأقصى {TRIM_MAX_SECONDS} ثانية)",
+            parse_mode="HTML")
+        return
+
+    flt_key = None
+    if action == "flt":
+        if not premium:
+            await _pro_upsell(q)
+            return
+        flt_key = FILTER_CHOICE.get(f"{uid_now}:{sid}")
+        if not flt_key:
+            await q.message.reply_text("❌ اختر فلتراً أولاً من قائمة 🎨 إضافة فلاتر.")
+            return
+
+    trim_rng = None
+    if action == "cut":
+        if not premium:
+            await q.message.reply_text("✂️ <b>قص المقطع</b> ميزة لمشتركي Pro 👑", parse_mode="HTML", reply_markup=_plans_markup())
+            return
+        trim_rng = TRIM_RANGE.get(f"{uid_now}:{sid}")
+        if not trim_rng:
+            await q.message.reply_text("❌ انتهت صلاحية القص، أعد الضغط على ✂️ من الرابط.")
+            return
+
     # فحص الزحمة: لو عدد الطلبات المنتظرة وصل للحد الأقصى، نرفض فوراً برسالة واضحة
     # بدل ما نضيف الطلب لطابور بلا سقف يتراكم ويصير هو نفسه سبب انفجار الذاكرة.
     global _pending_downloads
     async with _pending_lock:
-        if _pending_downloads >= MAX_QUEUE_SIZE:
+        if _pending_downloads >= MAX_QUEUE_SIZE and not premium:
             await q.message.reply_text(
-                "🚧 البوت مزدحم جداً حالياً (عدد كبير من الطلبات بالطابور).\n"
-                "حاول مرة ثانية بعد كم دقيقة 🙏"
+                "🚧 البوت مزدحم حالياً (عدد كبير من الطلبات بالطابور).\n\n"
+                "تقدر تنتظر شوي وتحاول مرة ثانية، أو تتخطى الطابور بالاشتراك في Pro 👑\n"
+                "<i>البوت يبقى مجاني، وPro اختياري.</i>",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("👑 تخطي الطابور (Pro)", callback_data="pro_menu", style="primary")]])
             )
             return
         _pending_downloads += 1
@@ -1098,7 +1452,7 @@ async def download_action_callback(update: Update, context: ContextTypes.DEFAULT
                 _pending_downloads -= 1
         return
 
-    if action == "vid":
+    if action in ("vid", "cut", "flt"):
         opts = {
             # تخفيف شرط الصيغة: بعض المنصات (بينترست مثلاً) ترجع ملف واحد مدمج (فيديو+صوت) مو
             # مسارين منفصلين، وكان شرط bestvideo+bestaudio الصارم يفشّل هالحالات بدون داعٍ.
@@ -1159,17 +1513,51 @@ async def download_action_callback(update: Update, context: ContextTypes.DEFAULT
             }
         }
 
+    plain_opts = None
+    if action == "aud" and premium:
+        import copy
+        plain_opts = copy.deepcopy(opts)
+        opts['writethumbnail'] = True
+        opts['postprocessors'] = [
+            {'key': 'FFmpegThumbnailsConvertor', 'format': 'jpg', 'when': 'before_dl'},
+            {'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'},
+            {'key': 'FFmpegMetadata', 'add_metadata': True},
+            {'key': 'EmbedThumbnail'},
+        ]
+
     file_path = None
+    cut_src = None
     success_download = False
 
     # === مرحلة التحميل فقط - محاولة واحدة بس (بدون إعادة محاولة) عشان السرعة والخفة ===
     async with DOWNLOAD_SEMAPHORE:
         await status_msg.edit_text("🚀 جاري التحميل...")
         try:
-            if _is_tiktok(url):
-                file_path = (await run_isolated("download", url, opts))["file"]
-            else:
-                file_path = await asyncio.wait_for(run_blocking(_blocking_download, url, opts), timeout=90)
+            async def _dl(o):
+                if _is_tiktok(url):
+                    return (await run_isolated("download", url, o))["file"]
+                return await asyncio.wait_for(run_blocking(_blocking_download, url, o), timeout=90)
+            try:
+                file_path = await _dl(opts)
+            except Exception as _e1:
+                if plain_opts is None:
+                    raise
+                logger.error(f"Pro audio enrich failed, retrying plain: {_e1}")
+                file_path = await _dl(plain_opts)
+            if action == "cut":
+                await status_msg.edit_text("✂️ جاري القص...")
+                cut_src = file_path
+                file_path = f"cut_{sid}.mp4"
+                ok = await _blocking_ffmpeg_cut(cut_src, file_path, trim_rng[0], trim_rng[1] - trim_rng[0])
+                if not ok:
+                    raise Exception("ffmpeg cut failed")
+            if action == "flt":
+                await status_msg.edit_text("🎨 جاري تطبيق الفلتر (قد ياخذ دقيقة)...")
+                cut_src = file_path
+                file_path = f"flt_{sid}.mp4"
+                ok = await _ffmpeg_apply_filter(cut_src, file_path, FILTERS[flt_key][1])
+                if not ok:
+                    raise Exception("ffmpeg filter failed")
             if action == "aud": file_path = file_path.rsplit('.', 1)[0] + '.mp3'
             if action == "voc": file_path = file_path.rsplit('.', 1)[0] + '.ogg'
 
@@ -1195,7 +1583,7 @@ async def download_action_callback(update: Update, context: ContextTypes.DEFAULT
 
             await status_msg.edit_text("📤 جاري إرسال الملف...")
             with open(file_path, 'rb') as f:
-                if action == "vid": await q.message.reply_video(video=f, caption="🎬 تم بواسطة @ZenDown_Bot", supports_streaming=True)
+                if action in ("vid", "cut", "flt"): await q.message.reply_video(video=f, caption="🎬 تم بواسطة @ZenDown_Bot", supports_streaming=True)
                 elif action == "aud": await q.message.reply_audio(audio=f, caption="🎵 تم بواسطة @ZenDown_Bot")
                 elif action == "voc": await q.message.reply_voice(voice=f, caption="🎙 تم بواسطة @ZenDown_Bot")
 
@@ -1218,9 +1606,10 @@ async def download_action_callback(update: Update, context: ContextTypes.DEFAULT
         track_download_status(False, platform)
         await status_msg.edit_text("❌ حدث خطأ أثناء معالجة وإرسال الملف.")
     finally:
-        if file_path and os.path.exists(file_path):
-            try: os.remove(file_path)
-            except Exception: pass
+        for _p in (file_path, cut_src):
+            if _p and os.path.exists(_p):
+                try: os.remove(_p)
+                except Exception: pass
         async with _pending_lock:
             _pending_downloads -= 1
 
@@ -1275,13 +1664,19 @@ async def _post_init(application):
     try:
         await application.bot.set_my_commands([
             ("start", "🚀 بدء استخدام البوت"),
+            ("pro", "👑 باقات Pro"),
+            ("qr", "📱 تحويل رابط إلى QR"),
             ("mystats", "📊 إحصائياتي"),
+            ("paysupport", "💬 دعم المدفوعات"),
         ])
         # أوامر الأدمن - تظهر لك أنت فقط في قائمة "/" (المستخدمون العاديون ما يشوفونها)
         from telegram import BotCommandScopeChat
         await application.bot.set_my_commands([
             ("start", "🚀 بدء استخدام البوت"),
+            ("pro", "👑 باقات Pro"),
+            ("qr", "📱 تحويل رابط إلى QR"),
             ("mystats", "📊 إحصائياتي"),
+            ("paysupport", "💬 دعم المدفوعات"),
             ("stats", "📈 إحصائيات البوت"),
             ("broadcast", "📢 تفعيل الإذاعة"),
             ("all_errors", "🛑 كل الأخطاء (شامل تيك توك ويوتيوب)"),
@@ -1303,6 +1698,13 @@ def main():
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, broadcast_capture), group=-1)
     app.add_handler(CallbackQueryHandler(broadcast_cancel_callback, pattern="^bc_cancel$"))
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("pro", pro_command))
+    app.add_handler(MessageHandler(filters.Regex(r"^(الباقات|باقات|اشتراك|الاشتراك|pro|Pro|PRO)$"), pro_command))
+    app.add_handler(CommandHandler("qr", qr_command))
+    app.add_handler(CommandHandler("paysupport", paysupport_command))
+    app.add_handler(CallbackQueryHandler(pro_menu_callback, pattern="^pro_menu$"))
+    app.add_handler(CallbackQueryHandler(filter_preview_callback, pattern="^flp_"))
+    app.add_handler(CallbackQueryHandler(buy_plan_callback, pattern="^buy_"))
     app.add_handler(CommandHandler("broadcast", broadcast_command))
     
     app.add_handler(CallbackQueryHandler(check_sub_callback, pattern="^check_sub$"))
@@ -1332,6 +1734,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
 
