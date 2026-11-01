@@ -449,19 +449,19 @@ async def cookies_check_command(update: Update, context: ContextTypes.DEFAULT_TY
         return
     path = "/etc/secrets/cookies.txt"
     if not os.path.exists(path):
-        await update.effective_message.reply_text("❌ ملف الكوكيز غير موجود في السيرفر (المسار: /etc/secrets/cookies.txt).\nتأكد من اسم الملف في Secret Files.")
+        await update.message.reply_text("❌ ملف الكوكيز غير موجود في السيرفر (المسار: /etc/secrets/cookies.txt).\nتأكد من اسم الملف في Secret Files.")
         return
     try:
         raw = open(path, encoding="utf-8", errors="ignore").read()
     except Exception as e:
-        await update.effective_message.reply_text(f"❌ تعذر قراءة الملف: {e}")
+        await update.message.reply_text(f"❌ تعذر قراءة الملف: {e}")
         return
     lines = [l for l in raw.splitlines() if l.strip() and not l.startswith("#")]
     good = [l.split("\t") for l in lines if len(l.split("\t")) == 7]
     bad = len(lines) - len(good)
     names = sorted({r[5] for r in good if "youtube.com" in r[0] or "google.com" in r[0]})
     first = raw.splitlines()[0][:40] if raw.strip() else "(فارغ)"
-    await update.effective_message.reply_text(
+    await update.message.reply_text(
         f"🍪 <b>فحص الكوكيز</b>\n"
         f"الملف موجود ✅ ({len(raw)} حرف)\n"
         f"السطر الأول: <code>{first}</code>\n"
@@ -477,7 +477,7 @@ async def show_errors_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not user or user.id != ADMIN_ID:
         return
     text = _format_errors_list("آخر أخطاء المنصات الأخرى (بدون تيك توك/يوتيوب)", RECENT_ERRORS_OTHER)
-    await update.effective_message.reply_text(text, parse_mode="HTML")
+    await update.message.reply_text(text, parse_mode="HTML")
 
 async def show_all_errors_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """يعرض كل الأخطاء المسجلة شامل تيك توك ويوتيوب."""
@@ -485,7 +485,7 @@ async def show_all_errors_command(update: Update, context: ContextTypes.DEFAULT_
     if not user or user.id != ADMIN_ID:
         return
     text = _format_errors_list("كل الأخطاء المسجلة (شامل تيك توك ويوتيوب)", RECENT_ERRORS)
-    await update.effective_message.reply_text(text, parse_mode="HTML")
+    await update.message.reply_text(text, parse_mode="HTML")
 
 # ================== لوحة إحصائياتي (شخصية لكل مستخدم) ==================
 PLATFORM_ICONS = {
@@ -648,7 +648,7 @@ async def show_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
     markup = InlineKeyboardMarkup([[InlineKeyboardButton("تحديث 🔄", callback_data="refresh_stats", style="primary")]])
-    if update.callback_query and update.callback_query.data == "refresh_stats":
+    if update.callback_query:
         await update.callback_query.answer("تم التحديث 🔄")
         try:
             await msg.edit_text(stats_msg, parse_mode="HTML", reply_markup=markup)
@@ -657,236 +657,73 @@ async def show_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     else:
         await msg.reply_text(stats_msg, parse_mode="HTML", reply_markup=markup)
 
-# ================== الإذاعة (شريط تقدم + إلغاء + حذف من عند الجميع) ==================
-BROADCAST_MODE = {"on": False}
-BC = {"running": False, "cancel": False}
-ALBUMS = {}            # media_group_id -> {"ids": [...], "fwd": bool, "chat": id}
-ADMIN_PENDING = {"mode": None}   # grant / revoke
-_BG_TASKS = set()
+# ================== الإذاعة ==================
+BROADCAST_MODE = {"on": False, "group": None}
 
-def _bg(coro):
-    t = asyncio.create_task(coro)
-    _BG_TASKS.add(t)
-    t.add_done_callback(_BG_TASKS.discard)
-    return t
-
-def _bar(done, total, width=12):
-    p = (done / total) if total else 1
-    n = int(p * width)
-    return "▰" * n + "▱" * (width - n) + f"  {int(p * 100)}%"
-
-def _bc_cancel_markup():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("⛔ إلغاء الإذاعة", callback_data="bc_stop", style="danger")]])
-
-def _bc_delete_markup():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("🗑 حذف الإذاعة من عند الجميع", callback_data="bc_del")]])
-
-def _make_sender(bot, src_chat, ids, forwarded):
-    async def sender(uid):
-        if len(ids) == 1:
-            if forwarded:
-                m = await bot.forward_message(chat_id=uid, from_chat_id=src_chat, message_id=ids[0])
-            else:
-                m = await bot.copy_message(chat_id=uid, from_chat_id=src_chat, message_id=ids[0])
-            return [m.message_id]
-        if forwarded:
-            res = await bot.forward_messages(chat_id=uid, from_chat_id=src_chat, message_ids=ids)
-        else:
-            res = await bot.copy_messages(chat_id=uid, from_chat_id=src_chat, message_ids=ids)
-        return [x.message_id for x in res]
-    return sender
-
-def _make_text_sender(bot, text):
-    async def sender(uid):
-        m = await bot.send_message(chat_id=uid, text=text)
-        return [m.message_id]
-    return sender
-
-async def _bc_send_one(sender, uid):
+async def _do_broadcast_copy(bot, src_chat, msg_id, forwarded, reply_to, notify=True):
+    users = list(stats["users"].keys())
+    status = None
+    if notify:
+        status = await bot.send_message(chat_id=ADMIN_ID, text=f"🚀 جاري الإرسال إلى {len(users)} مستخدم...")
     from telegram.error import RetryAfter, Forbidden, BadRequest, TimedOut, NetworkError
-    for _ in range(4):
-        try:
-            return "ok", await sender(int(uid))
-        except RetryAfter as e:
-            # تيليجرام طلب تبطئة - ننتظر ونعيد نفس المستخدم (ما نحسبه فاشل)
-            await asyncio.sleep(float(getattr(e, "retry_after", 5)) + 1)
-        except (TimedOut, NetworkError):
-            await asyncio.sleep(2)
-        except Forbidden:
-            return "blocked", None
-        except BadRequest as e:
-            low = str(e).lower()
-            if "chat not found" in low or "deactivated" in low:
-                return "blocked", None
-            return "other", str(e)[:60]
-        except Exception as e:
-            return "other", str(e)[:60]
-    return "other", "فشل بعد 4 محاولات"
-
-async def _run_broadcast(bot, sender):
-    if BC["running"]:
-        await bot.send_message(chat_id=ADMIN_ID, text="⚠️ فيه عملية إذاعة/حذف جارية حالياً، انتظر تخلص.")
-        return
-    BC["running"] = True
-    BC["cancel"] = False
-    try:
-        users = list(stats["users"].keys())
-        total = len(users)
-        rec = {"time": datetime.now().isoformat(), "msgs": {}}
-        stats["last_broadcast"] = rec
-        status = await bot.send_message(
-            chat_id=ADMIN_ID, text=f"📢 <b>جاري الإذاعة</b>\n\n{_bar(0, total)}\n0 / {total}",
-            parse_mode="HTML", reply_markup=_bc_cancel_markup())
-        ok = blocked = other = done = 0
-        errs = {}
-        last_edit = time.time()
-        for uid in users:
-            if BC["cancel"]:
+    success = blocked = other = 0
+    err_samples = {}
+    for uid in users:
+        for attempt in range(4):
+            try:
+                if forwarded:
+                    await bot.forward_message(chat_id=int(uid), from_chat_id=src_chat, message_id=msg_id)
+                else:
+                    await bot.copy_message(chat_id=int(uid), from_chat_id=src_chat, message_id=msg_id)
+                success += 1
                 break
-            r, info = await _bc_send_one(sender, uid)
-            if r == "ok":
-                ok += 1
-                rec["msgs"][uid] = info or []
-            elif r == "blocked":
-                blocked += 1
-            else:
+            except RetryAfter as e:
+                # تيليجرام طلب تبطئة (Flood) - ننتظر المدة المطلوبة ونعيد نفس المستخدم، ما نحسبه فاشل
+                await asyncio.sleep(float(getattr(e, "retry_after", 5)) + 1)
+            except (TimedOut, NetworkError):
+                await asyncio.sleep(2)
+            except Forbidden:
+                blocked += 1  # حاظر البوت فعلاً
+                break
+            except BadRequest as e:
+                if "chat not found" in str(e).lower():
+                    blocked += 1
+                else:
+                    other += 1
+                    err_samples[str(e)[:60]] = err_samples.get(str(e)[:60], 0) + 1
+                break
+            except Exception as e:
                 other += 1
-                errs[info] = errs.get(info, 0) + 1
-            done += 1
-            if time.time() - last_edit >= 3:
-                last_edit = time.time()
-                try:
-                    await status.edit_text(
-                        f"📢 <b>جاري الإذاعة</b>\n\n{_bar(done, total)}\n{done} / {total}\n\n"
-                        f"✅ وصلت: {ok}   🚫 حاظرين: {blocked}   ⚠️ أخطاء: {other}",
-                        parse_mode="HTML", reply_markup=_bc_cancel_markup())
-                except Exception:
-                    pass
-            await asyncio.sleep(0.06)
-        cancelled = BC["cancel"]
-        save_stats()
-        detail = "".join(f"\n  • {k}: {v}" for k, v in list(errs.items())[:5])
-        title = "⛔ <b>أُلغيت الإذاعة</b>" if cancelled else "✅ <b>تمت الإذاعة</b>"
+                err_samples[str(e)[:60]] = err_samples.get(str(e)[:60], 0) + 1
+                break
+        else:
+            other += 1
+            err_samples["فشل بعد 4 محاولات"] = err_samples.get("فشل بعد 4 محاولات", 0) + 1
+        await asyncio.sleep(0.06)
+    if status:
+        detail = "".join(f"\n  • {k}: {v}" for k, v in list(err_samples.items())[:5])
         try:
             await status.edit_text(
-                f"{title}\n\n{_bar(done, total)}\n{done} / {total}\n\n"
-                f"✅ وصلت فعلاً: {ok}\n🚫 حاظرين البوت: {blocked}\n⚠️ أخطاء أخرى: {other}{detail}",
-                parse_mode="HTML", reply_markup=_bc_delete_markup() if ok else None)
+                f"✅ تمت الإذاعة!\n\n- وصلت فعلاً: {success}\n- حاظرين البوت: {blocked}\n- أخطاء أخرى: {other}{detail}\n\nالمجموع: {len(users)}")
         except Exception:
             pass
-    except Exception as e:
-        logger.error(f"Broadcast crashed: {e}")
-    finally:
-        BC["running"] = False
-
-async def _run_bc_delete(bot):
-    rec = stats.get("last_broadcast") or {}
-    msgs = rec.get("msgs") or {}
-    if not msgs:
-        await bot.send_message(chat_id=ADMIN_ID, text="ℹ️ ما فيه إذاعة محفوظة لحذفها.")
-        return
-    if BC["running"]:
-        await bot.send_message(chat_id=ADMIN_ID, text="⚠️ فيه عملية إذاعة/حذف جارية حالياً، انتظر تخلص.")
-        return
-    from telegram.error import RetryAfter
-    BC["running"] = True
-    try:
-        total = sum(len(v) for v in msgs.values())
-        status = await bot.send_message(chat_id=ADMIN_ID, text=f"🗑 <b>جاري حذف الإذاعة</b>\n\n{_bar(0, total)}", parse_mode="HTML")
-        ok = fail = done = 0
-        last_edit = time.time()
-        for uid, ids in list(msgs.items()):
-            for mid in ids:
-                for _ in range(2):
-                    try:
-                        await bot.delete_message(chat_id=int(uid), message_id=mid)
-                        ok += 1
-                        break
-                    except RetryAfter as e:
-                        await asyncio.sleep(float(getattr(e, "retry_after", 5)) + 1)
-                    except Exception:
-                        fail += 1
-                        break
-                done += 1
-                await asyncio.sleep(0.05)
-            if time.time() - last_edit >= 3:
-                last_edit = time.time()
-                try:
-                    await status.edit_text(f"🗑 <b>جاري حذف الإذاعة</b>\n\n{_bar(done, total)}\n{done} / {total}", parse_mode="HTML")
-                except Exception:
-                    pass
-        rec["msgs"] = {}
-        rec["deleted"] = True
-        save_stats()
-        try:
-            await status.edit_text(
-                f"✅ <b>تم حذف الإذاعة</b>\n\n🗑 حُذفت: {ok}\n⚠️ تعذر حذفها: {fail}\n"
-                "<i>(تيليجرام يسمح بحذف رسائل البوت خلال 48 ساعة من إرسالها)</i>", parse_mode="HTML")
-        except Exception:
-            pass
-    except Exception as e:
-        logger.error(f"Broadcast delete crashed: {e}")
-    finally:
-        BC["running"] = False
-
-async def _album_broadcast(bot, gid):
-    await asyncio.sleep(2)   # نجمع باقي صور الألبوم
-    g = ALBUMS.pop(gid, None)
-    if not g:
-        return
-    ids = sorted(g["ids"])
-    await _run_broadcast(bot, _make_sender(bot, g["chat"], ids, g["fwd"]))
 
 async def broadcast_capture(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """يلتقط رسائل الأدمن: إدخال لوحة التحكم (منح/إلغاء اشتراك) أو رسالة الإذاعة (تُرسل كما هي تماماً)."""
+    """يلتقط أي رسالة من الأدمن أثناء وضع الإذاعة ويرسلها للجميع كما هي (محوّلة تبقى محوّلة)."""
     user = update.effective_user
     m = update.effective_message
-    if not user or user.id != ADMIN_ID or not m or update.effective_chat.type != "private":
+    if not user or user.id != ADMIN_ID or not m or not BROADCAST_MODE["on"]:
         return
-
-    # إدخال نصي مطلوب من لوحة الأدمن
-    if ADMIN_PENDING["mode"] and m.text and not m.text.startswith("/"):
-        mode = ADMIN_PENDING["mode"]
-        ADMIN_PENDING["mode"] = None
-        nums = re.findall(r"\d+", m.text.translate(_AR_DIGITS))
-        if mode == "grant":
-            if len(nums) < 2:
-                await m.reply_text("⚠️ الصيغة: <code>ID عدد_الأيام</code> مثال: <code>123456789 30</code>", parse_mode="HTML")
-            else:
-                tid, days = nums[0], int(nums[1])
-                base = premium_until(tid) or datetime.now()
-                exp = base + timedelta(days=days)
-                stats.setdefault("premium", {})[tid] = exp.isoformat()
-                save_stats()
-                await m.reply_text(f"✅ تم منح Pro للمستخدم {tid} لمدة {days} يوم (حتى {exp.strftime('%Y-%m-%d')}).")
-                try:
-                    await context.bot.send_message(chat_id=int(tid), text=f"🎁 تم منحك اشتراك <b>Pro</b> لمدة {days} يوم! استمتع 👑", parse_mode="HTML")
-                except Exception:
-                    pass
-        elif mode == "revoke":
-            if not nums:
-                await m.reply_text("⚠️ أرسل ID المستخدم فقط.")
-            elif stats.get("premium", {}).pop(nums[0], None):
-                save_stats()
-                await m.reply_text(f"✅ تم إلغاء اشتراك المستخدم {nums[0]}.")
-            else:
-                await m.reply_text("ℹ️ هذا المستخدم ما عنده اشتراك.")
-        raise ApplicationHandlerStop
-
-    # بقية صور ألبوم قيد الجمع
-    if m.media_group_id and m.media_group_id in ALBUMS:
-        ALBUMS[m.media_group_id]["ids"].append(m.message_id)
-        raise ApplicationHandlerStop
-
-    if not BROADCAST_MODE["on"]:
+    if update.effective_chat.type != "private":
         return
+    gid = m.media_group_id
+    if gid and BROADCAST_MODE["group"] == gid:
+        # بقية صور نفس الألبوم
+        asyncio.create_task(_do_broadcast_copy(context.bot, m.chat_id, m.message_id, bool(m.forward_origin), None, notify=False))
+        raise ApplicationHandlerStop
     BROADCAST_MODE["on"] = False
-    fwd = bool(m.forward_origin)
-    if m.media_group_id:
-        ALBUMS[m.media_group_id] = {"ids": [m.message_id], "fwd": fwd, "chat": m.chat_id}
-        _bg(_album_broadcast(context.bot, m.media_group_id))
-    else:
-        _bg(_run_broadcast(context.bot, _make_sender(context.bot, m.chat_id, [m.message_id], fwd)))
+    BROADCAST_MODE["group"] = gid
+    asyncio.create_task(_do_broadcast_copy(context.bot, m.chat_id, m.message_id, bool(m.forward_origin), None))
     raise ApplicationHandlerStop
 
 async def broadcast_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -897,196 +734,44 @@ async def broadcast_cancel_callback(update: Update, context: ContextTypes.DEFAUL
     BROADCAST_MODE["on"] = False
     await q.answer("تم إلغاء الإذاعة")
     try:
-        await q.message.edit_text("❌ تم إلغاء تفعيل الإذاعة.")
+        await q.message.edit_text("❌ تم إلغاء الإذاعة.")
     except Exception:
         pass
-
-async def bc_stop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    if q.from_user.id != ADMIN_ID:
-        await q.answer()
-        return
-    BC["cancel"] = True
-    await q.answer("⛔ جاري إيقاف الإذاعة...")
-
-async def bc_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    if q.from_user.id != ADMIN_ID:
-        await q.answer()
-        return
-    await q.answer()
-    if q.data == "bc_del":
-        await q.message.reply_text(
-            "⚠️ <b>تأكيد:</b> حذف آخر إذاعة من عند جميع المستخدمين؟",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ نعم، احذف", callback_data="bc_delyes", style="danger"),
-                InlineKeyboardButton("↩️ لا", callback_data="bc_delno")]]))
-    elif q.data == "bc_delyes":
-        try: await q.message.delete()
-        except Exception: pass
-        _bg(_run_bc_delete(context.bot))
-    else:
-        try: await q.message.delete()
-        except Exception: pass
 
 async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user or user.id != ADMIN_ID:
         return
-    msg = update.effective_message
-    text = (msg.text or "").replace("/broadcast", "", 1).strip()
+
+    text = update.message.text.replace("/broadcast", "").strip()
     if not text:
         BROADCAST_MODE["on"] = True
-        await msg.reply_text(
-            "📢 تم تفعيل الإذاعة.\nأرسل الآن أي رسالة (نص/صورة/ألبوم/ملف/محولة من قناة...) وتنرسل للجميع كما هي تماماً.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ إلغاء الإذاعة", callback_data="bc_cancel")]]))
+        BROADCAST_MODE["group"] = None
+        await update.message.reply_text(
+            "📢 تم تفعيل الإذاعة.\nأرسل الآن أي رسالة (نص/صورة/ملف/محولة من قناة...) وتنرسل للجميع كما هي تماماً.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ إلغاء الإذاعة", callback_data="bc_cancel")]])
+        )
         return
-    if not stats["users"]:
-        await msg.reply_text("❌ لا يوجد مستخدمين مسجلين في قاعدة البيانات.")
+
+    users = list(stats["users"].keys())
+    if not users:
+        await update.message.reply_text("❌ لا يوجد مستخدمين مسجلين في قاعدة البيانات.")
         return
-    _bg(_run_broadcast(context.bot, _make_text_sender(context.bot, text)))
 
-# ================== لوحة تحكم الأدمن ==================
-def _admin_home_text():
-    n_pro = sum(1 for u in stats.get("premium", {}) if premium_until(u))
-    return (
-        "⚙️ <b>لوحة تحكم الأدمن</b>\n━━━━━━━\n"
-        f"👥 المستخدمون: <b>{len(stats.get('users', {}))}</b>   👑 Pro: <b>{n_pro}</b>\n"
-        f"🔧 الصيانة: <b>{'🔴 مفعّلة' if get_setting('maint') else '🟢 متوقفة'}</b>\n"
-        f"🚧 حد الطابور: <b>{get_setting('queue')}</b>\n\n"
-        "اختر ما تبي تتحكم فيه 👇"
-    )
+    msg = await update.message.reply_text(f"🚀 جاري إرسال الرسالة إلى {len(users)} مستخدم...\nيرجى الانتظار لتفادي حظر تيليجرام.")
 
-def _admin_home_markup():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 الإحصائيات", callback_data="adm_stats"), InlineKeyboardButton("📢 إذاعة", callback_data="adm_bc")],
-        [InlineKeyboardButton("🛑 كل الأخطاء", callback_data="adm_err"), InlineKeyboardButton("⚠️ أخطاء المنصات", callback_data="adm_err2")],
-        [InlineKeyboardButton("🍪 فحص الكوكيز", callback_data="adm_cookies"), InlineKeyboardButton("🗑 حذف آخر إذاعة", callback_data="adm_bcdel")],
-        [InlineKeyboardButton("👑 إدارة Pro", callback_data="adm_pro"), InlineKeyboardButton("⚙️ الإعدادات", callback_data="adm_set")],
-    ])
+    success = 0
+    failed = 0
 
-def _adm_stepper(label, key, tag):
-    return [InlineKeyboardButton("➖", callback_data=f"adm_n_{tag}_d"),
-            InlineKeyboardButton(f"{label}: {get_setting(key)}", callback_data="adm_noop"),
-            InlineKeyboardButton("➕", callback_data=f"adm_n_{tag}_u")]
+    for uid in users:
+        try:
+            await context.bot.send_message(chat_id=int(uid), text=text)
+            success += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            failed += 1
 
-def _settings_markup():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"🎨 الأزرار الرئيسية: {BTN_STYLE_LABELS[get_setting('btn_main')]}", callback_data="adm_s_btn_main")],
-        [InlineKeyboardButton(f"🎨 الأزرار الثانوية: {BTN_STYLE_LABELS[get_setting('btn_sec')]}", callback_data="adm_s_btn_sec")],
-        _adm_stepper("🚧 الطابور", "queue", "queue"),
-        _adm_stepper("✂️ أقصى قص (ث)", "trim_max", "trim"),
-        _adm_stepper("🎬 أقصى فلتر (ث)", "filter_max", "filt"),
-        [InlineKeyboardButton(f"🔧 وضع الصيانة: {'🔴 مفعّل' if get_setting('maint') else '🟢 متوقف'}", callback_data="adm_s_maint")],
-        [InlineKeyboardButton("💰 أسعار الباقات", callback_data="adm_price")],
-        [InlineKeyboardButton("⬅️ رجوع", callback_data="adm_home")],
-    ])
-
-def _price_markup():
-    rows = []
-    for k in ("daily", "weekly", "monthly"):
-        rows.append([InlineKeyboardButton("➖", callback_data=f"adm_pr_{k}_d"),
-                     InlineKeyboardButton(f"{PLANS[k]['label']}: {PLANS[k]['stars']} ⭐", callback_data="adm_noop"),
-                     InlineKeyboardButton("➕", callback_data=f"adm_pr_{k}_u")])
-    rows.append([InlineKeyboardButton("⬅️ رجوع", callback_data="adm_set")])
-    return InlineKeyboardMarkup(rows)
-
-def _pro_admin_markup():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ منح اشتراك", callback_data="adm_grant"), InlineKeyboardButton("➖ إلغاء اشتراك", callback_data="adm_revoke")],
-        [InlineKeyboardButton("📋 المشتركون الحاليون", callback_data="adm_prolist")],
-        [InlineKeyboardButton("⬅️ رجوع", callback_data="adm_home")],
-    ])
-
-async def _adm_edit(q, text, markup):
-    try:
-        await q.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
-    except Exception:
-        pass
-
-async def admin_panel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not user or user.id != ADMIN_ID:
-        return
-    await update.effective_message.reply_text(_admin_home_text(), parse_mode="HTML", reply_markup=_admin_home_markup())
-
-SET_TEXT = "⚙️ <b>الإعدادات</b>\nكل تغيير يُطبَّق فوراً ويُحفظ تلقائياً."
-
-async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    if q.from_user.id != ADMIN_ID:
-        await q.answer()
-        return
-    d = q.data
-    parts = d.split("_")
-    await q.answer()
-
-    if d == "adm_noop":
-        return
-    if d == "adm_home":
-        await _adm_edit(q, _admin_home_text(), _admin_home_markup())
-    elif d == "adm_stats":
-        await show_stats_command(update, context)
-    elif d == "adm_err":
-        await show_all_errors_command(update, context)
-    elif d == "adm_err2":
-        await show_errors_command(update, context)
-    elif d == "adm_cookies":
-        await cookies_check_command(update, context)
-    elif d == "adm_bc":
-        BROADCAST_MODE["on"] = True
-        await q.message.reply_text(
-            "📢 تم تفعيل الإذاعة.\nأرسل الآن أي رسالة (نص/صورة/ألبوم/ملف/محولة من قناة...) وتنرسل للجميع كما هي تماماً.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ إلغاء الإذاعة", callback_data="bc_cancel")]]))
-    elif d == "adm_bcdel":
-        await q.message.reply_text(
-            "⚠️ <b>تأكيد:</b> حذف آخر إذاعة من عند جميع المستخدمين؟", parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ نعم، احذف", callback_data="bc_delyes", style="danger"),
-                InlineKeyboardButton("↩️ لا", callback_data="bc_delno")]]))
-    elif d == "adm_set":
-        await _adm_edit(q, SET_TEXT, _settings_markup())
-    elif d in ("adm_s_btn_main", "adm_s_btn_sec"):
-        key = "btn_main" if d.endswith("main") else "btn_sec"
-        cur = get_setting(key)
-        nxt = BTN_STYLES[(BTN_STYLES.index(cur) + 1) % len(BTN_STYLES)] if cur in BTN_STYLES else BTN_STYLES[0]
-        set_setting(key, nxt)
-        await _adm_edit(q, SET_TEXT, _settings_markup())
-    elif d == "adm_s_maint":
-        set_setting("maint", not get_setting("maint"))
-        await _adm_edit(q, SET_TEXT, _settings_markup())
-    elif d.startswith("adm_n_"):
-        tag, direction = parts[2], parts[3]
-        cfg = {"queue": ("queue", 1, 1, 30), "trim": ("trim_max", 10, 10, 300), "filt": ("filter_max", 5, 5, 120)}.get(tag)
-        if cfg:
-            key, step, lo, hi = cfg
-            val = int(get_setting(key)) + (step if direction == "u" else -step)
-            set_setting(key, max(lo, min(hi, val)))
-        await _adm_edit(q, SET_TEXT, _settings_markup())
-    elif d == "adm_price":
-        await _adm_edit(q, "💰 <b>أسعار الباقات</b> (بالنجوم)\nتتحدث البطاقة وفواتير الدفع فوراً.", _price_markup())
-    elif d.startswith("adm_pr_"):
-        plan, direction = parts[2], parts[3]
-        if plan in PLANS:
-            val = int(get_setting(f"price_{plan}")) + (1 if direction == "u" else -1)
-            set_setting(f"price_{plan}", max(1, min(1000, val)))
-        await _adm_edit(q, "💰 <b>أسعار الباقات</b> (بالنجوم)\nتتحدث البطاقة وفواتير الدفع فوراً.", _price_markup())
-    elif d == "adm_pro":
-        await _adm_edit(q, "👑 <b>إدارة Pro</b>", _pro_admin_markup())
-    elif d == "adm_grant":
-        ADMIN_PENDING["mode"] = "grant"
-        await q.message.reply_text("➕ أرسل: <code>ID عدد_الأيام</code>\nمثال: <code>123456789 30</code>", parse_mode="HTML")
-    elif d == "adm_revoke":
-        ADMIN_PENDING["mode"] = "revoke"
-        await q.message.reply_text("➖ أرسل ID المستخدم لإلغاء اشتراكه.")
-    elif d == "adm_prolist":
-        rows = []
-        for uid in stats.get("premium", {}):
-            u = premium_until(uid)
-            if u:
-                rows.append(f"• <code>{uid}</code> — حتى {u.strftime('%Y-%m-%d')}")
-        await q.message.reply_text("📋 <b>المشتركون الحاليون</b>\n\n" + ("\n".join(rows[:60]) if rows else "لا يوجد مشتركون حالياً."), parse_mode="HTML")
+    await msg.edit_text(f"✅ تمت عملية الإذاعة بنجاح!\n\n- نجح الإرسال إلى: {success} مستخدم\n- فشل الإرسال إلى: {failed} مستخدم (قاموا بحظر البوت غالباً)")
 
 # ================== المعالجة والتحميل ==================
 def _blocking_get_thumbnail(url):
@@ -1248,10 +933,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = update.message.text.strip()
 
-    if get_setting("maint") and user.id != ADMIN_ID:
-        await update.message.reply_text("🔧 البوت تحت الصيانة حالياً، نعود قريباً بإذن الله.")
-        return
-
     if text.strip().lower() == "qr":
         QR_MODE_USERS.add(user.id)
         await update.message.reply_text(
@@ -1265,29 +946,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await generate_qr(update, text)
         return
 
-    # وضع القص: إدخال سهل خطوة بخطوة (بداية ثم نهاية) أو الاثنين بنفس الرسالة
+    # وضع القص (Pro): ينتظر نطاق مثل 0:10-0:40
     if user.id in TRIM_PENDING and not text.startswith("http"):
-        pend = TRIM_PENDING[user.id]
-        sid = pend["sid"]
-        toks = _time_tokens(text)
-        if not toks:
-            await update.message.reply_text("ما فهمت 😅 أرسل رقم بسيط مثل <code>10</code> أو <code>1:05</code>", parse_mode="HTML")
+        sid = TRIM_PENDING[user.id]
+        rng = parse_trim_range(text)
+        if not rng or rng[1] <= rng[0] or (rng[1] - rng[0]) > TRIM_MAX_SECONDS:
+            await update.message.reply_text(
+                f"⚠️ اكتب النطاق بهذا الشكل: <code>0:10-0:40</code>\nالحد الأقصى للقص {TRIM_MAX_SECONDS} ثانية، والنهاية بعد البداية.",
+                parse_mode="HTML")
             return
-        if pend["start"] is None and len(toks) == 1:
-            pend["start"] = toks[0]
-            await update.message.reply_text(f"✅ البداية: <b>{_fmt(toks[0])}</b>\nالحين أرسل <b>وقت النهاية</b> (مثال: <code>{toks[0] + 30}</code>)", parse_mode="HTML")
-            return
-        s_t, e_t = (toks[0], toks[1]) if (pend["start"] is None) else (pend["start"], toks[0])
-        if e_t <= s_t:
-            pend["start"] = None if len(toks) >= 2 else pend["start"]
-            await update.message.reply_text(f"⚠️ النهاية لازم تكون بعد البداية ({_fmt(s_t)}). أرسل وقت النهاية من جديد.")
-            return
-        if e_t - s_t > TRIM_MAX_SECONDS:
-            await update.message.reply_text(f"⚠️ أقصى مدة للقص {TRIM_MAX_SECONDS} ثانية، وأنت اخترت {e_t - s_t}. أرسل وقت النهاية من جديد.")
-            return
-        _edit_get(user.id, sid)["c"] = (s_t, e_t)
+        TRIM_RANGE[f"{user.id}:{sid}"] = rng
         TRIM_PENDING.pop(user.id, None)
-        await _send_edit_menu(update.message, user.id, sid)
+        await update.message.reply_text(
+            f"✂️ جاهز: من <b>{text.split('-')[0].strip()}</b> إلى <b>{text.split('-')[-1].strip()}</b> ({rng[1]-rng[0]} ثانية)\nاضغط للبدء 👇",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✂️ ابدأ القص", callback_data=f"down_cut_{sid}", style="success")]]))
         return
     TRIM_PENDING.pop(user.id, None)
 
@@ -1344,63 +1017,27 @@ async def process_link_info(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
     caption = "🎬 <b>رابط جاهز للتحميل</b>"
     markup = InlineKeyboardMarkup([
-        [_btn("🎥 فيديو MP4", f"down_vid_{sid}", "main")],
-        [_btn("🎵 صوت MP3", f"down_aud_{sid}", "sec"),
-         _btn("🖼 صورة", f"down_img_{sid}", "sec")],
-        [_btn("📝 نسخ الوصف", f"down_cap_{sid}", "sec")],
-        [_btn("تعديل المقطع 🎬", f"ed_menu_{sid}", "main")]
+        [InlineKeyboardButton("🎥 فيديو MP4", callback_data=f"down_vid_{sid}", style="primary")],
+        [InlineKeyboardButton("🎵 صوت MP3" + (" + غلاف 👑" if is_premium(update.effective_user.id) else ""), callback_data=f"down_aud_{sid}", style="success"),
+         InlineKeyboardButton("🖼 صورة", callback_data=f"down_img_{sid}", style="success")],
+        [InlineKeyboardButton("📝 نسخ الوصف", callback_data=f"down_cap_{sid}", style="primary")],
+        [InlineKeyboardButton("تعديل المقطع 🎬", callback_data=f"down_trm_{sid}", style="primary")]
     ])
 
     await update.message.reply_text(caption, parse_mode="HTML", reply_markup=markup)
 
 # ================== التحميل الذكي المحسّن والجدار الأمني ==================
 # ================== زر التبرع بنجمة (Telegram Stars) ==================
-# ================== الإعدادات القابلة للتحكم من لوحة الأدمن ==================
+# ================== اشتراك Pro (باقات بالنجوم) ==================
 PLANS = {
-    "daily":   {"stars": 5,  "days": 1,  "label": "يومي"},
-    "weekly":  {"stars": 15, "days": 7,  "label": "أسبوعي"},
-    "monthly": {"stars": 30, "days": 30, "label": "شهري"},
+    "daily":   {"stars": 5,  "days": 1,  "label": "يومي",   "badge": ""},
+    "weekly":  {"stars": 15, "days": 7,  "label": "أسبوعي", "badge": ""},
+    "monthly": {"stars": 30, "days": 30, "label": "شهري",   "badge": "🔥 الأوفر"},
 }
-DEFAULT_SETTINGS = {
-    "btn_main": "primary", "btn_sec": "success",
-    "queue": 6, "trim_max": 60, "filter_max": 30,
-    "maint": False,
-    "price_daily": 5, "price_weekly": 15, "price_monthly": 30,
-}
-BTN_STYLES = ["primary", "success", "danger", "default"]
-BTN_STYLE_LABELS = {"primary": "🔵 أزرق", "success": "🟢 أخضر", "danger": "🔴 أحمر", "default": "⚪ افتراضي"}
+TRIM_PENDING = {}   # user_id -> sid  (ينتظر نطاق القص)
+TRIM_RANGE = {}     # f"{user_id}:{sid}" -> (start, end)
 TRIM_MAX_SECONDS = 60
 FILTER_MAX_SECONDS = 30
-
-def get_setting(key):
-    return stats.get("settings", {}).get(key, DEFAULT_SETTINGS[key])
-
-def apply_settings():
-    """يطبّق الإعدادات المحفوظة على المتغيرات العامة (يُستدعى عند الإقلاع وعند كل تغيير)."""
-    global MAX_QUEUE_SIZE, TRIM_MAX_SECONDS, FILTER_MAX_SECONDS
-    try:
-        MAX_QUEUE_SIZE = int(get_setting("queue"))
-        TRIM_MAX_SECONDS = int(get_setting("trim_max"))
-        FILTER_MAX_SECONDS = int(get_setting("filter_max"))
-        for k in PLANS:
-            PLANS[k]["stars"] = int(get_setting(f"price_{k}"))
-    except Exception as e:
-        logger.error(f"apply_settings failed: {e}")
-
-def set_setting(key, value):
-    stats.setdefault("settings", {})[key] = value
-    apply_settings()
-    save_stats()
-
-def _btn(text, data, kind=None):
-    """زر بلون حسب إعدادات الأدمن: kind=main (رئيسي) أو sec (ثانوي)."""
-    if kind in ("main", "sec"):
-        st = get_setting("btn_main" if kind == "main" else "btn_sec")
-        if st and st != "default":
-            return InlineKeyboardButton(text, callback_data=data, style=st)
-    return InlineKeyboardButton(text, callback_data=data)
-
-# ================== اشتراك Pro (باقات بالنجوم) ==================
 FILTERS = {
     "bw":      ("⚫ أبيض وأسود", "hue=s=0"),
     "sepia":   ("🟤 سيبيا", "colorchannelmixer=.393:.769:.189:0:.349:.686:.168:0:.272:.534:.131:0"),
@@ -1411,8 +1048,7 @@ FILTERS = {
     "vintage": ("📼 قديم", "curves=preset=vintage"),
     "mirror":  ("🪞 انعكاس", "hflip"),
 }
-EDIT_STATE = {}     # f"{user_id}:{sid}" -> {"f": مفتاح الفلتر أو None, "c": (بداية, نهاية) أو None}
-TRIM_PENDING = {}   # user_id -> {"sid": ..., "start": None أو ثواني}
+FILTER_CHOICE = {}              # f"{user_id}:{sid}" -> filter key
 THUMB_CACHE = BoundedCache(max_size=60)   # sid -> bytes (صورة المعاينة)
 
 def is_premium(user_id) -> bool:
@@ -1442,22 +1078,23 @@ def _plans_text(user_id) -> str:
         f"{status}"
         "البوت يبقى <b>مجاني بالكامل</b> كما هو، وPro إضافة اختيارية لمن يبي مزايا أكثر:\n\n"
         "🚀 <b>تخطي الطابور</b> — ما يُرفض طلبك وقت الازدحام\n"
-        f"🎬 <b>تعديل المقطع</b> — فلاتر + قص في ملف واحد (قص حتى {TRIM_MAX_SECONDS} ثانية)\n"
+        "✂️ <b>قص المقطع</b> — خذ الجزء اللي تبيه فقط (حتى 60 ثانية)\n"
+        "🎧 <b>MP3 كامل</b> — الصوت يوصلك باسمه وصورة الغلاف\n"
         "👑 <b>شارة Pro</b> في إحصائياتك\n\n"
         "───────────────\n"
         "⭐ <b>الباقات</b>\n"
         "───────────────\n"
-        f"▫️ يومي — {PLANS['daily']['stars']} ⭐\n"
-        f"▫️ أسبوعي — {PLANS['weekly']['stars']} ⭐\n"
-        f"▫️ شهري — {PLANS['monthly']['stars']} ⭐  🔥 الأوفر\n\n"
+        "▫️ يومي — 5 ⭐\n"
+        "▫️ أسبوعي — 15 ⭐\n"
+        "▫️ شهري — 30 ⭐  🔥 الأوفر\n\n"
         "اختر باقتك من الأزرار 👇"
     )
 
 def _plans_markup():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"🔥 شهري — {PLANS['monthly']['stars']} ⭐", callback_data="buy_monthly", style="primary")],
-        [InlineKeyboardButton(f"أسبوعي — {PLANS['weekly']['stars']} ⭐", callback_data="buy_weekly"),
-         InlineKeyboardButton(f"يومي — {PLANS['daily']['stars']} ⭐", callback_data="buy_daily")],
+        [InlineKeyboardButton("🔥 شهري — 30 ⭐", callback_data="buy_monthly", style="primary")],
+        [InlineKeyboardButton("أسبوعي — 15 ⭐", callback_data="buy_weekly"),
+         InlineKeyboardButton("يومي — 5 ⭐", callback_data="buy_daily")],
     ])
 
 async def pro_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1483,7 +1120,7 @@ async def buy_plan_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_invoice(
             chat_id=q.message.chat_id,
             title=f"ZenDown Pro — {plan['label']}",
-            description=f"اشتراك Pro لمدة {plan['days']} يوم: تخطي الطابور + تعديل المقطع (فلاتر وقص).",
+            description=f"اشتراك Pro لمدة {plan['days']} يوم: تخطي الطابور + قص المقطع + MP3 كامل.",
             payload=f"plan_{key}",
             currency="XTR",
             prices=[LabeledPrice(f"Pro {plan['label']}", plan["stars"])],
@@ -1514,85 +1151,35 @@ async def qr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "تم تفعيل خدمة QR 📱\nأرسل أي رابط أو نص لتحويله إلى صورة QR.",
         reply_markup=_qr_cancel_markup())
 
-# ---------- أدوات الوقت (إدخال سهل: 10 أو 1:05 أو بالأرقام العربية) ----------
-_AR_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789")
-
 def _parse_time(t: str):
+    parts = [int(x) for x in t.strip().split(":")]
     sec = 0
-    for p in t.strip().split(":"):
-        sec = sec * 60 + int(p)
+    for p in parts:
+        sec = sec * 60 + p
     return sec
 
-def _time_tokens(text: str):
-    """يستخرج كل الأوقات من النص: '10 40' أو '0:10-0:40' أو 'من 10 الى 40' ..."""
-    text = text.translate(_AR_DIGITS)
-    out = []
-    for tok in re.findall(r"\d+(?::\d+){1,2}|\d+", text):
-        try:
-            out.append(_parse_time(tok))
-        except Exception:
-            pass
-    return out
+def parse_trim_range(text: str):
+    m = re.match(r"^\s*(\d+(?::\d+){0,2})\s*(?:-|–|—|الى|إلى|to)\s*(\d+(?::\d+){0,2})\s*$", text.strip(), re.I)
+    if not m:
+        return None
+    try:
+        return _parse_time(m.group(1)), _parse_time(m.group(2))
+    except Exception:
+        return None
 
-def _fmt(sec: int) -> str:
-    sec = int(sec)
-    return f"{sec // 60}:{sec % 60:02d}"
+async def _blocking_ffmpeg_cut(src, dst, start, dur):
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-y", "-loglevel", "error", "-ss", str(start), "-i", src, "-t", str(dur),
+        "-c", "copy", "-avoid_negative_ts", "make_zero", dst,
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=60)
+    except asyncio.TimeoutError:
+        try: proc.kill()
+        except Exception: pass
+        raise
+    return proc.returncode == 0 and os.path.exists(dst) and os.path.getsize(dst) > 0
 
-# ---------- حالة تعديل المقطع ----------
-def _edit_get(uid, sid):
-    k = f"{uid}:{sid}"
-    if k not in EDIT_STATE:
-        if len(EDIT_STATE) > 400:
-            EDIT_STATE.pop(next(iter(EDIT_STATE)))
-        EDIT_STATE[k] = {"f": None, "c": None}
-    return EDIT_STATE[k]
-
-def _edit_menu_text(uid, sid):
-    st = _edit_get(uid, sid)
-    flt = FILTERS[st["f"]][0] if st["f"] else "بدون"
-    c = st["c"]
-    cut = f"{_fmt(c[0])} ← {_fmt(c[1])} ({c[1] - c[0]} ث)" if c else "بدون"
-    note = f"\n<i>مع الفلتر يكون الناتج حتى {FILTER_MAX_SECONDS} ثانية</i>" if st["f"] else ""
-    return (
-        "🎬 <b>تعديل المقطع</b>\n━━━━━━━\n"
-        f"🎨 الفلتر: <b>{flt}</b>\n"
-        f"✂️ القص: <b>{cut}</b>{note}\n\n"
-        "اختر ما تبيه، ثم اضغط <b>تطبيق وإرسال</b> 👇"
-    )
-
-def _edit_menu_markup(uid, sid):
-    st = _edit_get(uid, sid)
-    rows = [
-        [_btn("🎨 إضافة فلتر" if not st["f"] else "🎨 تغيير الفلتر", f"ed_fl_{sid}", "main")],
-        [_btn("✂️ قص الفيديو" if not st["c"] else "✂️ تغيير القص", f"ed_cut_{sid}", "main")],
-    ]
-    if st["f"] or st["c"]:
-        rows.append([InlineKeyboardButton("✅ تطبيق وإرسال", callback_data=f"ed_go_{sid}", style="success")])
-        rows.append([InlineKeyboardButton("🗑 مسح التعديلات", callback_data=f"ed_clr_{sid}")])
-    return InlineKeyboardMarkup(rows)
-
-async def _send_edit_menu(message, uid, sid):
-    await message.reply_text(_edit_menu_text(uid, sid), parse_mode="HTML", reply_markup=_edit_menu_markup(uid, sid))
-
-def _filters_markup(sid):
-    keys = list(FILTERS.keys())
-    rows = []
-    for i in range(0, len(keys), 2):
-        rows.append([InlineKeyboardButton(FILTERS[k][0], callback_data=f"ed_p_{k}_{sid}") for k in keys[i:i + 2]])
-    rows.append([InlineKeyboardButton("↩️ رجوع", callback_data=f"ed_menu_{sid}")])
-    return InlineKeyboardMarkup(rows)
-
-async def _pro_upsell_apply(q):
-    """يظهر لغير المشترك عند محاولة استلام الفيديو المعدّل: مختصر + الباقات."""
-    await q.message.reply_text(
-        "👑 <b>استلام الفيديو المعدّل متاح لمشتركي Pro</b>\n\n"
-        "🎬 فلاتر + قص في ملف واحد\n"
-        "🚀 تخطي الطابور\n"
-        "👑 شارة Pro\n\n"
-        "اختر باقتك 👇",
-        parse_mode="HTML", reply_markup=_plans_markup())
-
-# ---------- أدوات ffmpeg ----------
 async def _ffmpeg_exec(args, timeout):
     proc = await asyncio.create_subprocess_exec(
         "ffmpeg", "-y", "-loglevel", "error", *args,
@@ -1605,22 +1192,13 @@ async def _ffmpeg_exec(args, timeout):
         raise
     return proc.returncode == 0
 
-async def _ffmpeg_edit(src, dst, cut, vf):
-    """يطبّق القص و/أو الفلتر في خطوة واحدة. القص وحده سريع (بدون إعادة ترميز)،
-    ومع الفلتر نعيد الترميز بإعدادات خفيفة (ultrafast، حد أقصى 720p، مدة محدودة)."""
-    start = cut[0] if cut else 0
-    dur = (cut[1] - cut[0]) if cut else None
-    if not vf:
-        args = ["-ss", str(start), "-i", src] + (["-t", str(dur)] if dur else []) + \
-               ["-c", "copy", "-avoid_negative_ts", "make_zero", dst]
-        ok = await _ffmpeg_exec(args, timeout=60)
-    else:
-        d = min(dur, FILTER_MAX_SECONDS) if dur else FILTER_MAX_SECONDS
-        ok = await _ffmpeg_exec([
-            "-ss", str(start), "-t", str(d), "-i", src,
-            "-vf", f"{vf},scale=-2:'min(720,trunc(ih/2)*2)'",
-            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-threads", "1",
-            "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", dst], timeout=150)
+async def _ffmpeg_apply_filter(src, dst, vf):
+    """يطبّق الفلتر على أول FILTER_MAX_SECONDS ثانية (إعادة ترميز خفيفة: ultrafast، حد أقصى 720p)."""
+    ok = await _ffmpeg_exec([
+        "-t", str(FILTER_MAX_SECONDS), "-i", src,
+        "-vf", f"{vf},scale=-2:'min(720,trunc(ih/2)*2)'",
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-threads", "1",
+        "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", dst], timeout=150)
     return ok and os.path.exists(dst) and os.path.getsize(dst) > 0
 
 async def _filter_preview_image(img_bytes, vf, tag):
@@ -1638,105 +1216,66 @@ async def _filter_preview_image(img_bytes, vf, tag):
             try: os.remove(p)
             except Exception: pass
 
-# ---------- معالج أزرار تعديل المقطع ----------
-async def edit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def _filters_markup(sid):
+    keys = list(FILTERS.keys())
+    rows = []
+    for i in range(0, len(keys), 2):
+        rows.append([InlineKeyboardButton(FILTERS[k][0], callback_data=f"flp_{k}_{sid}") for k in keys[i:i+2]])
+    return InlineKeyboardMarkup(rows)
+
+async def _pro_upsell(q):
+    await q.message.reply_text(
+        "🎬 <b>تعديل المقطع</b> ميزة مخصصة لمشتركي <b>Pro</b> 👑\n"
+        "قص المقاطع وإضافة الفلاتر.\n"
+        "<i>البوت يبقى مجاني، وPro اختياري 👇</i>\n\n"
+        + _plans_text(q.from_user.id),
+        parse_mode="HTML", reply_markup=_plans_markup())
+
+async def filter_preview_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     uid = q.from_user.id
-    if get_setting("maint") and uid != ADMIN_ID:
-        await q.answer("🔧 البوت تحت الصيانة حالياً", show_alert=True)
+    if not is_premium(uid):
+        await q.answer()
+        await _pro_upsell(q)
         return
-    parts = q.data.split("_")          # ed_<action>[_<arg>]_<sid>
-    action, sid = parts[1], parts[-1]
-    arg = parts[2] if len(parts) == 4 else None
+    try:
+        _, key, sid = q.data.split("_")
+    except Exception:
+        await q.answer()
+        return
+    if key not in FILTERS:
+        await q.answer()
+        return
     url = URL_CACHE.get(sid)
     if not url:
         await q.answer("انتهت صلاحية الجلسة، أعد إرسال الرابط", show_alert=True)
         return
-
-    if action == "menu":
-        await q.answer()
-        TRIM_PENDING.pop(uid, None)
-        await _send_edit_menu(q.message, uid, sid)
-        return
-
-    if action == "clr":
-        await q.answer("تم المسح")
-        EDIT_STATE[f"{uid}:{sid}"] = {"f": None, "c": None}
-        try:
-            await q.message.edit_text(_edit_menu_text(uid, sid), parse_mode="HTML", reply_markup=_edit_menu_markup(uid, sid))
-        except Exception:
-            pass
-        return
-
-    if action == "fl":
-        await q.answer()
-        await q.message.reply_text(
-            "🎨 <b>الفلاتر</b>\nاضغط على فلتر لمعاينته على صورة من المقطع 👇",
-            parse_mode="HTML", reply_markup=_filters_markup(sid))
-        return
-
-    if action == "pick" and arg in FILTERS:
-        _edit_get(uid, sid)["f"] = arg
-        await q.answer("✅ تم اختيار الفلتر")
-        await _send_edit_menu(q.message, uid, sid)
-        return
-
-    if action == "p" and arg in FILTERS:
-        await q.answer("⏳ جاري تجهيز المعاينة...")
-        try:
-            img = THUMB_CACHE.get(sid)
-            if not img:
-                if _is_tiktok(url):
-                    async with TIKTOK_INFO_SEM:
-                        thumb_url = (await run_isolated("info", url, _tt_info_opts())).get("thumbnail")
-                else:
-                    thumb_url = await asyncio.wait_for(run_blocking(_blocking_get_thumbnail, url), timeout=30)
-                if not thumb_url:
-                    raise Exception("no thumbnail")
-                img = await asyncio.wait_for(run_blocking(_blocking_fetch_bytes, thumb_url), timeout=20)
-                THUMB_CACHE[sid] = img
-            label, vf = FILTERS[arg]
-            out = await _filter_preview_image(img, vf, f"{uid}_{sid}_{arg}")
-            if not out:
-                raise Exception("preview failed")
-            await q.message.reply_photo(
-                photo=out,
-                caption=f"🎨 معاينة: <b>{label}</b>",
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("✅ اختيار هذا الفلتر", callback_data=f"ed_pick_{arg}_{sid}", style="success")],
-                    [InlineKeyboardButton("🎨 فلاتر أخرى", callback_data=f"ed_fl_{sid}")],
-                ]))
-        except Exception as e:
-            logger.error(f"Filter preview failed: {e}")
-            await q.message.reply_text("❌ تعذرت معاينة الفلتر لهذا الرابط.")
-        return
-
-    if action == "cut":
-        await q.answer()
-        TRIM_PENDING[uid] = {"sid": sid, "start": None}
-        quick = [InlineKeyboardButton(f"⏱ أول {n} ث", callback_data=f"ed_q_{n}_{sid}") for n in (15, 30, 60) if n <= TRIM_MAX_SECONDS]
-        rows = [quick] if quick else []
-        rows.append([InlineKeyboardButton("↩️ رجوع", callback_data=f"ed_menu_{sid}")])
-        await q.message.reply_text(
-            "✂️ <b>قص الفيديو</b>\n\n"
-            "اختر قصاً سريعاً من الأزرار، أو أرسل <b>وقت البداية</b> برقم بسيط (مثال: <code>10</code> أو <code>1:05</code>)، "
-            "وبعدها أرسل <b>وقت النهاية</b>.\n"
-            f"<i>أقصى مدة للقص: {TRIM_MAX_SECONDS} ثانية.</i>",
-            parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
-        return
-
-    if action == "q" and arg and arg.isdigit():
-        n = min(int(arg), TRIM_MAX_SECONDS)
-        _edit_get(uid, sid)["c"] = (0, n)
-        TRIM_PENDING.pop(uid, None)
-        await q.answer("✅ تم تحديد القص")
-        await _send_edit_menu(q.message, uid, sid)
-        return
-
-    await q.answer()
-
-apply_settings()
+    await q.answer("⏳ جاري تجهيز المعاينة...")
+    try:
+        img = THUMB_CACHE.get(sid)
+        if not img:
+            if _is_tiktok(url):
+                async with TIKTOK_INFO_SEM:
+                    thumb_url = (await run_isolated("info", url, _tt_info_opts())).get("thumbnail")
+            else:
+                thumb_url = await asyncio.wait_for(run_blocking(_blocking_get_thumbnail, url), timeout=30)
+            if not thumb_url:
+                raise Exception("no thumbnail")
+            img = await asyncio.wait_for(run_blocking(_blocking_fetch_bytes, thumb_url), timeout=20)
+            THUMB_CACHE[sid] = img
+        label, vf = FILTERS[key]
+        out = await _filter_preview_image(img, vf, f"{uid}_{sid}_{key}")
+        if not out:
+            raise Exception("preview failed")
+        FILTER_CHOICE[f"{uid}:{sid}"] = key
+        await q.message.reply_photo(
+            photo=out,
+            caption=f"🎨 معاينة الفلتر: <b>{label}</b>\n<i>يُطبَّق على أول {FILTER_MAX_SECONDS} ثانية من المقطع</i>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ تطبيق الفلتر", callback_data=f"down_flt_{sid}", style="success")]]))
+    except Exception as e:
+        logger.error(f"Filter preview failed: {e}")
+        await q.message.reply_text("❌ تعذرت معاينة الفلتر لهذا الرابط.")
 
 async def donate_star_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -1776,7 +1315,7 @@ async def successful_payment_callback(update: Update, context: ContextTypes.DEFA
             f"🎉 <b>أهلاً بك في ZenDown Pro!</b>\n\n"
             f"✅ تم تفعيل الباقة <b>{plan['label']}</b>\n"
             f"📅 تنتهي في: <b>{new_exp.strftime('%Y-%m-%d %H:%M')}</b>\n\n"
-            "مزاياك الآن:\n🚀 تخطي الطابور\n🎬 تعديل المقطع (فلاتر + قص) من زر «تعديل المقطع» تحت أي رابط\n\nشكراً لدعمك 💙",
+            "مزاياك الآن:\n🚀 تخطي الطابور\n✂️ قص المقطع (زر ✂️ تحت أي رابط)\n🎧 MP3 باسمه وغلافه\n\nشكراً لدعمك 💙",
             parse_mode="HTML")
         return
     stats["star_donations"] = stats.get("star_donations", 0) + 1
@@ -1786,18 +1325,10 @@ async def successful_payment_callback(update: Update, context: ContextTypes.DEFA
 async def download_action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-
-    parts = q.data.split("_")
-    if parts[0] == "ed":          # ed_go_<sid> : تطبيق التعديلات (فلتر + قص)
-        action, sid = "edt", parts[-1]
-    else:
-        _, action, sid = parts
+    
+    _, action, sid = q.data.split("_")
     url = URL_CACHE.get(sid)
-
-    if get_setting("maint") and q.from_user.id != ADMIN_ID:
-        await q.message.reply_text("🔧 البوت تحت الصيانة حالياً، نعود قريباً بإذن الله.")
-        return
-
+    
     if not url:
         await q.message.reply_text("❌ انتهت صلاحية هذه الجلسة، أعد إرسال الرابط.")
         return
@@ -1825,14 +1356,57 @@ async def download_action_callback(update: Update, context: ContextTypes.DEFAULT
     uid_now = q.from_user.id
     premium = is_premium(uid_now)
 
-    edit_st = None
-    if action == "edt":
+    if action == "trm":
         if not premium:
-            await _pro_upsell_apply(q)
+            await _pro_upsell(q)
             return
-        edit_st = _edit_get(uid_now, sid)
-        if not edit_st["f"] and not edit_st["c"]:
-            await q.message.reply_text("اختر فلتراً أو قصاً أولاً من قائمة 🎬 تعديل المقطع.")
+        await q.message.reply_text(
+            "🎬 <b>تعديل المقطع</b>\nاختر ما تبيه 👇",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🎨 إضافة فلاتر", callback_data=f"down_fmenu_{sid}", style="primary")],
+                [InlineKeyboardButton("✂️ قص الفيديو", callback_data=f"down_cutm_{sid}", style="primary")],
+            ]))
+        return
+
+    if action == "fmenu":
+        if not premium:
+            await _pro_upsell(q)
+            return
+        await q.message.reply_text(
+            "🎨 <b>الفلاتر</b>\nاضغط على فلتر لمعاينته على صورة من المقطع، ثم اختر تطبيق 👇\n"
+            f"<i>الفلاتر تُطبَّق على أول {FILTER_MAX_SECONDS} ثانية.</i>",
+            parse_mode="HTML", reply_markup=_filters_markup(sid))
+        return
+
+    if action == "cutm":
+        if not premium:
+            await _pro_upsell(q)
+            return
+        TRIM_PENDING[uid_now] = sid
+        await q.message.reply_text(
+            f"✂️ <b>قص الفيديو</b>\nأرسل المدة اللي تبيها بهذا الشكل:\n<code>0:10-0:40</code>\n(الحد الأقصى {TRIM_MAX_SECONDS} ثانية)",
+            parse_mode="HTML")
+        return
+
+    flt_key = None
+    if action == "flt":
+        if not premium:
+            await _pro_upsell(q)
+            return
+        flt_key = FILTER_CHOICE.get(f"{uid_now}:{sid}")
+        if not flt_key:
+            await q.message.reply_text("❌ اختر فلتراً أولاً من قائمة 🎨 إضافة فلاتر.")
+            return
+
+    trim_rng = None
+    if action == "cut":
+        if not premium:
+            await q.message.reply_text("✂️ <b>قص المقطع</b> ميزة لمشتركي Pro 👑", parse_mode="HTML", reply_markup=_plans_markup())
+            return
+        trim_rng = TRIM_RANGE.get(f"{uid_now}:{sid}")
+        if not trim_rng:
+            await q.message.reply_text("❌ انتهت صلاحية القص، أعد الضغط على ✂️ من الرابط.")
             return
 
     # فحص الزحمة: لو عدد الطلبات المنتظرة وصل للحد الأقصى، نرفض فوراً برسالة واضحة
@@ -1878,7 +1452,7 @@ async def download_action_callback(update: Update, context: ContextTypes.DEFAULT
                 _pending_downloads -= 1
         return
 
-    if action in ("vid", "edt"):
+    if action in ("vid", "cut", "flt"):
         opts = {
             # تخفيف شرط الصيغة: بعض المنصات (بينترست مثلاً) ترجع ملف واحد مدمج (فيديو+صوت) مو
             # مسارين منفصلين، وكان شرط bestvideo+bestaudio الصارم يفشّل هالحالات بدون داعٍ.
@@ -1939,6 +1513,18 @@ async def download_action_callback(update: Update, context: ContextTypes.DEFAULT
             }
         }
 
+    plain_opts = None
+    if action == "aud" and premium:
+        import copy
+        plain_opts = copy.deepcopy(opts)
+        opts['writethumbnail'] = True
+        opts['postprocessors'] = [
+            {'key': 'FFmpegThumbnailsConvertor', 'format': 'jpg', 'when': 'before_dl'},
+            {'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'},
+            {'key': 'FFmpegMetadata', 'add_metadata': True},
+            {'key': 'EmbedThumbnail'},
+        ]
+
     file_path = None
     cut_src = None
     success_download = False
@@ -1947,18 +1533,31 @@ async def download_action_callback(update: Update, context: ContextTypes.DEFAULT
     async with DOWNLOAD_SEMAPHORE:
         await status_msg.edit_text("🚀 جاري التحميل...")
         try:
-            if _is_tiktok(url):
-                file_path = (await run_isolated("download", url, opts))["file"]
-            else:
-                file_path = await asyncio.wait_for(run_blocking(_blocking_download, url, opts), timeout=90)
-            if action == "edt":
-                await status_msg.edit_text("🎬 جاري تطبيق التعديلات (قد ياخذ دقيقة)...")
+            async def _dl(o):
+                if _is_tiktok(url):
+                    return (await run_isolated("download", url, o))["file"]
+                return await asyncio.wait_for(run_blocking(_blocking_download, url, o), timeout=90)
+            try:
+                file_path = await _dl(opts)
+            except Exception as _e1:
+                if plain_opts is None:
+                    raise
+                logger.error(f"Pro audio enrich failed, retrying plain: {_e1}")
+                file_path = await _dl(plain_opts)
+            if action == "cut":
+                await status_msg.edit_text("✂️ جاري القص...")
                 cut_src = file_path
-                file_path = f"edt_{sid}.mp4"
-                vf = FILTERS[edit_st["f"]][1] if edit_st["f"] else None
-                ok = await _ffmpeg_edit(cut_src, file_path, edit_st["c"], vf)
+                file_path = f"cut_{sid}.mp4"
+                ok = await _blocking_ffmpeg_cut(cut_src, file_path, trim_rng[0], trim_rng[1] - trim_rng[0])
                 if not ok:
-                    raise Exception("ffmpeg edit failed")
+                    raise Exception("ffmpeg cut failed")
+            if action == "flt":
+                await status_msg.edit_text("🎨 جاري تطبيق الفلتر (قد ياخذ دقيقة)...")
+                cut_src = file_path
+                file_path = f"flt_{sid}.mp4"
+                ok = await _ffmpeg_apply_filter(cut_src, file_path, FILTERS[flt_key][1])
+                if not ok:
+                    raise Exception("ffmpeg filter failed")
             if action == "aud": file_path = file_path.rsplit('.', 1)[0] + '.mp3'
             if action == "voc": file_path = file_path.rsplit('.', 1)[0] + '.ogg'
 
@@ -1984,7 +1583,7 @@ async def download_action_callback(update: Update, context: ContextTypes.DEFAULT
 
             await status_msg.edit_text("📤 جاري إرسال الملف...")
             with open(file_path, 'rb') as f:
-                if action in ("vid", "edt"): await q.message.reply_video(video=f, caption="🎬 تم بواسطة @ZenDown_Bot", supports_streaming=True)
+                if action in ("vid", "cut", "flt"): await q.message.reply_video(video=f, caption="🎬 تم بواسطة @ZenDown_Bot", supports_streaming=True)
                 elif action == "aud": await q.message.reply_audio(audio=f, caption="🎵 تم بواسطة @ZenDown_Bot")
                 elif action == "voc": await q.message.reply_voice(voice=f, caption="🎙 تم بواسطة @ZenDown_Bot")
 
@@ -2059,7 +1658,6 @@ async def _memory_watchdog():
 async def _post_init(application):
     asyncio.create_task(_memory_watchdog())
     await turso_load_on_startup()
-    apply_settings()
     asyncio.create_task(turso_sync_loop())
     # تيليجرام ما يسمح بأسماء أوامر عربية (لازم إنجليزي صغير بدون مسافات)، فنسجل الأمر
     # بالإنجليزي "mystats" لكن بوصف عربي - عشان يظهر بقائمة الأوامر لما يكتب المستخدم "/"
@@ -2071,7 +1669,7 @@ async def _post_init(application):
             ("mystats", "📊 إحصائياتي"),
             ("paysupport", "💬 دعم المدفوعات"),
         ])
-        # أمر الأدمن - يظهر لك أنت فقط في قائمة "/" (كل التحكم صار داخل لوحة واحدة)
+        # أوامر الأدمن - تظهر لك أنت فقط في قائمة "/" (المستخدمون العاديون ما يشوفونها)
         from telegram import BotCommandScopeChat
         await application.bot.set_my_commands([
             ("start", "🚀 بدء استخدام البوت"),
@@ -2079,7 +1677,11 @@ async def _post_init(application):
             ("qr", "📱 تحويل رابط إلى QR"),
             ("mystats", "📊 إحصائياتي"),
             ("paysupport", "💬 دعم المدفوعات"),
-            ("admin", "⚙️ لوحة تحكم الأدمن"),
+            ("stats", "📈 إحصائيات البوت"),
+            ("broadcast", "📢 تفعيل الإذاعة"),
+            ("all_errors", "🛑 كل الأخطاء (شامل تيك توك ويوتيوب)"),
+            ("errors", "⚠️ أخطاء المنصات الأخرى"),
+            ("cookies", "🍪 فحص الكوكيز"),
         ], scope=BotCommandScopeChat(chat_id=ADMIN_ID))
     except Exception as e:
         logger.error(f"set_my_commands failed: {e}")
@@ -2096,17 +1698,12 @@ def main():
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, broadcast_capture), group=-1)
     app.add_handler(CallbackQueryHandler(broadcast_cancel_callback, pattern="^bc_cancel$"))
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("admin", admin_panel_command))
-    app.add_handler(MessageHandler(filters.Regex(r"^(إعدادات|اعدادات) (الأدمن|الادمن)$|^لوحة (التحكم|الأدمن|الادمن)$|^(الأدمن|الادمن|ادمن)$"), admin_panel_command))
-    app.add_handler(CallbackQueryHandler(admin_callback, pattern="^adm_"))
-    app.add_handler(CallbackQueryHandler(bc_stop_callback, pattern="^bc_stop$"))
-    app.add_handler(CallbackQueryHandler(bc_delete_callback, pattern="^bc_(del|delyes|delno)$"))
-    app.add_handler(CallbackQueryHandler(edit_callback, pattern="^ed_(menu|fl|p|pick|cut|q|clr)_"))
     app.add_handler(CommandHandler("pro", pro_command))
     app.add_handler(MessageHandler(filters.Regex(r"^(الباقات|باقات|اشتراك|الاشتراك|pro|Pro|PRO)$"), pro_command))
     app.add_handler(CommandHandler("qr", qr_command))
     app.add_handler(CommandHandler("paysupport", paysupport_command))
     app.add_handler(CallbackQueryHandler(pro_menu_callback, pattern="^pro_menu$"))
+    app.add_handler(CallbackQueryHandler(filter_preview_callback, pattern="^flp_"))
     app.add_handler(CallbackQueryHandler(buy_plan_callback, pattern="^buy_"))
     app.add_handler(CommandHandler("broadcast", broadcast_command))
     
@@ -2126,7 +1723,7 @@ def main():
     app.add_handler(CommandHandler("mystats", show_my_stats_command))
     app.add_handler(MessageHandler(filters.Regex(r"^(احصائياتي|إحصائياتي)$"), show_my_stats_command))
 
-    app.add_handler(CallbackQueryHandler(download_action_callback, pattern="^(down_|ed_go_)"))
+    app.add_handler(CallbackQueryHandler(download_action_callback, pattern="^down_"))
     app.add_handler(CallbackQueryHandler(donate_star_callback, pattern="^donate_star$"))
     app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
@@ -2137,3 +1734,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
