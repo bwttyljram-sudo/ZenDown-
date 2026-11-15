@@ -65,9 +65,14 @@ TURSO_LOADED = False
 MAX_SEEN_USERS = 0
 GUARD_RATIO = 0.7
 DIRTY_USERS = set()
+STATS_VER = [0]            # يُستبدل من bot.py بعدّاد التغييرات المشترك
+_LAST_PUSHED_VER = -1
+STATE_FORCE_EVERY = 600    # حتى لو ما في تغيير مسجَّل: نحفظ كل 10 دقائق كتأمين
 BOOT_ID = uuid.uuid4().hex[:6]
 BOT_REF = {"bot": None}
 _LAST_SNAPSHOT_TS = 0.0
+_LAST_STATE_PUSH = 0.0
+STATE_EVERY = 120      # ثواني: الحالة العامة (تجميع ضخم) كل دقيقتين، أما المستخدمون والمشتركون فيُحفظون كل 20 ثانية
 _ALERT_TS = {}
 _MULTI_COUNT = 0
 
@@ -145,7 +150,8 @@ async def _turso_load_once():
         await _ensure_tables(client)
         rs = await client.execute("SELECT data FROM bot_state WHERE id = 1")
         if rs.rows:
-            merge_state(json.loads(rs.rows[0][0]))
+            _d = rs.rows[0][0]
+            merge_state(_unpack_stats(_d[3:]) if isinstance(_d, str) and _d.startswith("gz:") else json.loads(_d))
         known = set()
         rs = await client.execute("SELECT uid, last_seen, joined FROM bot_users")
         for r in rs.rows:
@@ -182,9 +188,9 @@ async def turso_load_on_startup():
             await asyncio.sleep(3)
     logger.error("🛑 Turso: فشل تحميل البيانات المحفوظة! تم إيقاف الحفظ التلقائي حتى لا تُمسح النسخة القديمة.")
 
-async def turso_push_now(snapshot=False):
+async def turso_push_now(snapshot=False, force=False):
     """يحفظ الحالة الحالية. محمي: لا يكتب قبل نجاح التحميل، ويرفض أي نقص مفاجئ في المستخدمين."""
-    global MAX_SEEN_USERS, _LAST_SNAPSHOT_TS
+    global MAX_SEEN_USERS, _LAST_SNAPSHOT_TS, _LAST_STATE_PUSH, _LAST_PUSHED_VER
     if not TURSO_ENABLED:
         return
     if not TURSO_LOADED:
@@ -224,12 +230,21 @@ async def turso_push_now(snapshot=False):
                 for uid, exp in chunk:
                     args += [uid, exp]
                 await client.execute(sql, args)
-            # 3) الحالة العامة
-            await client.execute(
+            # 3) الحالة العامة (ثقيلة: JSON كامل) - مو كل 20 ثانية، لأنها تعطّل المعالج الضعيف وقت الزحمة
+            _now = time.time()
+            _changed = STATS_VER[0] != _LAST_PUSHED_VER
+            if force or snapshot or (_changed and _now - _LAST_STATE_PUSH >= STATE_EVERY) \
+                    or _now - _LAST_STATE_PUSH >= STATE_FORCE_EVERY:
+                _LAST_STATE_PUSH = _now
+                _LAST_PUSHED_VER = STATS_VER[0]
+                # الحالة بدون users/premium (لهم جداولهم الخاصة) + ضغط gzip: حجم الإرسال يتقلص عدة أضعاف
+                _raw = json.dumps({k: v for k, v in stats.items() if k not in ("users", "premium")},
+                                  ensure_ascii=False).encode("utf-8")
+                _blob = "gz:" + base64.b64encode(await asyncio.to_thread(gzip.compress, _raw, 3)).decode()
+                await client.execute(
                 "INSERT INTO bot_state (id, data, updated_at) VALUES (1, ?, ?) "
                 "ON CONFLICT(id) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at",
-                [json.dumps(stats if DIRTY_USERS else {k: v for k, v in stats.items() if k not in ("users", "premium")}, ensure_ascii=False),
-                 datetime.now().isoformat()])
+                [_blob, datetime.now().isoformat()])
             # 4) لقطات تاريخية
             now_ts = time.time()
             if snapshot or now_ts - _LAST_SNAPSHOT_TS > 1800:
@@ -282,16 +297,18 @@ async def count_boots_24h() -> int:
         return -1
 
 async def turso_sync_loop():
-    """كل 20 ثانية: حفظ آمن + نبض. كل ساعة: تنظيف جلسات الأزرار القديمة."""
+    """كل 5 ثواني: دفعة جلسات الأزرار. كل 20 ثانية: حفظ آمن + نبض. كل ساعة: تنظيف الجلسات القديمة."""
     if not TURSO_ENABLED:
         return
     cycle = 0
     while True:
-        await asyncio.sleep(20)
+        await asyncio.sleep(5)
         cycle += 1
-        await turso_push_now()
-        await _heartbeat()
-        if cycle % 180 == 0:
+        await url_flush()
+        if cycle % 4 == 0:
+            await turso_push_now()
+            await _heartbeat()
+        if cycle % 720 == 0:
             try:
                 async with _tclient() as client:
                     await client.execute("DELETE FROM url_sessions WHERE created_at < ?", [(datetime.now() - timedelta(days=2)).isoformat()])
@@ -299,17 +316,38 @@ async def turso_sync_loop():
                 logger.error(f"session cleanup failed: {e}")
 
 # ---------- جلسات الأزرار تتحمل إعادة التشغيل ----------
+_URL_BUF = {}
+
 async def url_put(sid, url):
-    if not TURSO_ENABLED:
+    """يسجّل الجلسة في مخزن مؤقت خفيف؛ تُكتب دفعة واحدة كل 5 ثواني (url_flush) بدل اتصال لكل رابط."""
+    if TURSO_ENABLED and len(_URL_BUF) < 3000:
+        _URL_BUF[sid] = url
+
+async def url_flush():
+    if not (TURSO_ENABLED and _URL_BUF):
         return
+    items = list(_URL_BUF.items())[:300]
     try:
+        iso = datetime.now().isoformat()
         async with _tclient() as client:
-            await client.execute("INSERT OR REPLACE INTO url_sessions (sid, url, created_at) VALUES (?, ?, ?)", [sid, url, datetime.now().isoformat()])
+            for i in range(0, len(items), 50):
+                chunk = items[i:i + 50]
+                sql = "INSERT OR REPLACE INTO url_sessions (sid, url, created_at) VALUES " + ",".join(["(?,?,?)"] * len(chunk))
+                args = []
+                for sid, url in chunk:
+                    args += [sid, url, iso]
+                await client.execute(sql, args)
+        for sid, url in items:
+            if _URL_BUF.get(sid) == url:
+                _URL_BUF.pop(sid, None)
     except Exception as e:
-        logger.error(f"url_put failed: {e}")
+        logger.error(f"url_flush failed: {e}")
 
 async def get_session_url(sid):
     u = URL_CACHE.get(sid)
+    if u:
+        return u
+    u = _URL_BUF.get(sid)
     if u:
         return u
     if TURSO_ENABLED:
@@ -398,3 +436,4 @@ async def restore_from_bytes(raw: bytes):
     save_stats()
     await turso_push_now(snapshot=True)
     return before, added, len(stats["users"])
+
