@@ -143,7 +143,7 @@ _error_handler.setFormatter(logging.Formatter("%(message)s"))
 logging.getLogger().addHandler(_error_handler)  # يلتقط من كل اللوقرز، مو بس بتاعنا
 
 TOKEN = os.environ.get("BOT_TOKEN")
-CHANNEL = "@ZenoX_Tools"
+CHANNEL = "@Zenox_Tols"
 ADMIN_ID = 9253474579
 
 # ملف كوكيز اختياري - لو رفعته كـ Secret File بـ Render باسم cookies.txt
